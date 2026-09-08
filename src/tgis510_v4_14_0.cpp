@@ -351,7 +351,26 @@ constexpr uint32_t TARGET_DISPLAY_REFRESH_MS = 2000;
 constexpr uint16_t MAX_WM_WORDS = 128;
 
 // Spacing between successive column writes in the experimental 32x24 mode.
-constexpr uint32_t COLUMN_WRITE_INTERVAL_MS = 15;
+//
+// BANDWIDTH FIX (was a fixed 15ms guess): one column WM frame is
+// ESC+'W'+'M' (3) + 4-digit decimal address (4) + rows*4 hex data digits +
+// 2-digit hex FCS (2) + CR (1) bytes. At MATRIX_ROWS_EXPERIMENTAL=24 that's
+// 106 bytes; at 8N1 (10 bits/byte) and BAUD=38400 that takes ~27.6ms to
+// physically drain off the wire. The old fixed 15ms interval issued a new
+// column write before the previous one had finished transmitting -- the
+// same "PT starved mid-write" failure mode column-pacing exists to avoid,
+// just recurring at smaller scale: it would silently build an ever-growing
+// TX backlog under sustained use instead of actually pacing anything.
+// Computed from the real frame size and baud with a 50% margin so it stays
+// correct if BAUD or MATRIX_ROWS_EXPERIMENTAL ever change.
+constexpr uint16_t COLUMN_FRAME_BYTES =
+    3 /*ESC W M*/ + 4 /*decimal addr*/ +
+    (uint16_t)MATRIX_ROWS_EXPERIMENTAL * 4 /*hex data*/ +
+    2 /*hex fcs*/ + 1 /*CR*/;
+constexpr uint32_t COLUMN_FRAME_TX_TIME_US =
+    (uint32_t)COLUMN_FRAME_BYTES * 10UL * 1000000UL / (uint32_t)BAUD;
+constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
+    (COLUMN_FRAME_TX_TIME_US * 3UL / 2UL) / 1000UL + 1UL; // +50% margin, ceil to ms
 } // namespace NS12
 
 class NS12Manager {
@@ -380,7 +399,14 @@ public:
     n += writeHex2(&frame[n], fcs);
     frame[n++] = '\r';
 
-    Serial2.write(frame, n);
+    wmAttempts++;
+    size_t sent = Serial2.write(frame, n);
+    if (sent != n) {
+      // Partial write -- the PT never got a complete, valid frame. Nothing
+      // downstream checked this before, so a write silently dropped under
+      // TX backlog looked identical to a write that landed cleanly.
+      wmFailures++;
+    }
     // Blocking flush() intentionally removed from WM writes (kept for RM
     // reads) -- a stalled TX flush here would block the whole control loop
     // during InspectingTube.
@@ -400,11 +426,17 @@ public:
     n += writeHex2(&frame[n], fcs);
     frame[n++] = '\r';
 
-    Serial2.write(frame, n);
+    rmAttempts++;
+    size_t sent = Serial2.write(frame, n);
+    if (sent != n) {
+      // Request itself never fully went out -- don't burn the full
+      // RM_READ_TIMEOUT_MS waiting on a reply to a frame the PT never saw.
+      rmWriteFailures++;
+      return false;
+    }
     Serial2.flush(); // RM reads keep the blocking flush -- WM writes do not.
 
     bool ok = pollRead(count, out, NS12::RM_READ_TIMEOUT_MS);
-    rmAttempts++;
     if (ok) {
       rmSuccesses++;
     }
@@ -413,11 +445,17 @@ public:
 
   uint32_t rmAttemptCount() const { return rmAttempts; }
   uint32_t rmSuccessCount() const { return rmSuccesses; }
+  uint32_t rmWriteFailureCount() const { return rmWriteFailures; }
+  uint32_t wmAttemptCount() const { return wmAttempts; }
+  uint32_t wmFailureCount() const { return wmFailures; }
   void resetRmStats() { rmAttempts = 0; rmSuccesses = 0; }
 
 private:
   uint32_t rmAttempts = 0;
   uint32_t rmSuccesses = 0;
+  uint32_t rmWriteFailures = 0;
+  uint32_t wmAttempts = 0;
+  uint32_t wmFailures = 0;
 
   // Resyncs to the next ESC byte rather than trusting byte 0 == frame
   // start, discarding stray bytes instead of corrupting the response.
