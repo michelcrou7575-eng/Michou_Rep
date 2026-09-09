@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.4
+// Ref: TGIS-510_cpp_V4_15.5
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -129,6 +129,22 @@
 // RM test read is now disabled by default -- see
 // NS12_ENABLE_RM_TEST_READ in the NS12 namespace.
 //
+// FIELD UPDATE (V4.15.5): first full real-hardware run of the raw-delta
+// pipeline end to end -- confirmed working correctly, not just compiling.
+// Decoded a live telemetry WM frame by hand and every field matched the
+// Serial diagnostics panel exactly (fps, state, status bits). Baseline
+// recapture correctly freezes stats rather than showing garbage while in
+// progress (calculateFrameStatistics()/capture.onNewFrame() are gated
+// behind !rawBaselineCaptureInProgress in loop()). Idle raw delta sits
+// within +/-75 of baseline, comfortably under CAPTURE_TRIGGER_RAW_DELTA
+// (300) -- no false trigger at rest. NS12 WM attempts now climb at the
+// full undeferred 4/sec telemetry rate, confirming the V4.15.4 RM-disable
+// actually recovered that throughput. Only change this version: the
+// "Raw baseline: CAPTURED -- capturing now..." diagnostics line read as
+// contradictory (technically accurate -- the previous baseline stays in
+// use until a recapture completes -- but confusing) and is now one
+// unambiguous message instead of two concatenated ones.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -160,10 +176,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.4"
+#define FW_VERSION_STRING "V4.15.5"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_4.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_5.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1604,9 +1620,14 @@ void printDiagnostics() {
   Serial.printf("Camera initialized : %s\n", mlxInitialized ? "YES" : "NO");
   Serial.printf("Last frame         : %s\n", lastFrameValid ? "OK" : "FAILED");
   Serial.printf("Measured FPS       : %.2f\n", measuredFramesPerSecond);
-  Serial.printf("Raw baseline       : %s%s\n",
-                rawBaselineCaptured ? "CAPTURED" : "NOT CAPTURED (send 'B')",
-                rawBaselineCaptureInProgress ? " -- capturing now..." : "");
+  if (rawBaselineCaptureInProgress) {
+    Serial.printf("Raw baseline       : capturing now... (%u/%u frames, previous baseline %s)\n",
+                  rawBaselineFramesCollected, RAW_BASELINE_FRAME_COUNT,
+                  rawBaselineCaptured ? "still in use until this completes" : "none yet -- stats frozen");
+  } else {
+    Serial.printf("Raw baseline       : %s\n",
+                  rawBaselineCaptured ? "CAPTURED" : "NOT CAPTURED (send 'B')");
+  }
   Serial.printf("Min/Max/Avg raw delta : %.0f / %.0f / %.0f\n",
                 minimumTemperatureC, maximumTemperatureC, averageTemperatureC);
   Serial.printf("Implausible pixels : %u (outside %.0f..%.0f raw delta, rejected)\n",
