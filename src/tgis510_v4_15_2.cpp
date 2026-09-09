@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.1
+// Ref: TGIS-510_cpp_V4_15.2
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -70,6 +70,26 @@
 // this chip's real 4MB (ESP32-S3FH4R2 = Flash 4MB / PSRAM 2MB Quad).
 // Fixed in platformio.ini, not in this file.
 //
+// FIELD UPDATE (V4.15.2): NS12 write traffic confirmed alive on a scope,
+// and separately confirmed the "no Serial output" problem reproduces even
+// on the archived reference file with a completely different .cpp, which
+// rules out application code as the cause -- it's a build-config issue
+// (native USB CDC not enabled), fixed in platformio.ini alongside the
+// flash-size fix, not yet verified on hardware.
+//
+// Also V4.15.2: added (not yet wired into acquisition) placeholder
+// constants for a raw-ADC-delta HMI path -- see MATRIX_RAW_DELTA_MIN/MAX
+// and CAPTURE_TRIGGER_RAW_DELTA below. Intent: the HMI only shows 10
+// colors, so running full per-pixel MLX90640 calibration every frame to
+// throw away that precision is wasted CPU time; a raw read + per-pixel
+// baseline subtraction + linear map straight to a palette index is
+// intended to replace it for a faster response. Blocked on the actual
+// getRawFrame() signature from this project's vendored library fork
+// (not the standard Adafruit_MLX90640 API) before the real acquisition
+// path and the two-subpage-to-32x24 combination can be written --
+// guessing that part risks a silently checkerboard-corrupted image
+// rather than a compile error, so it isn't attempted here yet.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -101,10 +121,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.1"
+#define FW_VERSION_STRING "V4.15.2"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_1.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_2.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -348,6 +368,42 @@ static const float CAPTURE_TRIGGER_TEMP_C = 30.0f;
 // PLACEHOLDER (Action Item 7): needs real 200 m/min validation. Tuning knob
 // for "does one sampling window match one tube's FOV transit".
 static const uint8_t CAPTURE_SAMPLE_COUNT = 4;
+
+// =====================================================================
+// PLACEHOLDER (Action Item 8, added V4.15.2): raw-ADC-delta acquisition
+// path, not wired in yet.
+//
+// The HMI only ever displays 10 discrete colors, so running the MLX90640's
+// full per-pixel floating-point calibration (temperature-dependent gain/
+// offset compensation, ambient/VDD correction -- the expensive part of
+// getFrame(), not the I2C read itself) on all 768 pixels every frame is
+// wasted CPU time for that output resolution. The intended replacement:
+// read raw subpage data (getRawFrame(), not part of the standard Adafruit
+// library API -- this project uses a fork/patch that adds it), subtract a
+// once-captured per-pixel idle baseline (same idea as the existing 'B'
+// baseline-capture command and rawBaseline0/rawBaseline1 below), and
+// linearly map that raw delta straight to a 0-9 palette index. No degrees
+// C anywhere in that path.
+//
+// NOT YET WIRED IN: doing this correctly also requires knowing exactly how
+// the two raw subpages combine into one 32x24 image for MLX90640_CHESS
+// mode (which pixel comes from which subpage) -- getting that wrong
+// produces a checkerboard-corrupted image, not a compile error, so it's
+// not being guessed at here. Needs the actual getRawFrame() signature from
+// this project's vendored lib/Adafruit_MLX90640/ before that part is
+// implemented.
+//
+// These two thresholds are placeholders in a much more literal sense than
+// MATRIX_TEMP_MIN_C/MAX_C above: a Celsius guess has real-world grounding
+// (hot melt glue is known to run in the 150-200C range); a raw ADC delta
+// has none -- it could plausibly be tens or thousands depending on gain
+// and resolution settings. These values are arbitrary compile-time stand-
+// ins only. To get real numbers: capture a baseline with 'B' at room
+// temp, then use 'X' against both an idle scene and a known-hot scene,
+// read the reported raw-minus-baseline deltas, and use those.
+static const int32_t MATRIX_RAW_DELTA_MIN = 0;    // PLACEHOLDER, no physical grounding
+static const int32_t MATRIX_RAW_DELTA_MAX = 1000; // PLACEHOLDER, no physical grounding
+static const int32_t CAPTURE_TRIGGER_RAW_DELTA = 300; // PLACEHOLDER, no physical grounding
 
 // =====================================================================
 // Timing constraint (critical, unresolved):
