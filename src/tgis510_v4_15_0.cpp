@@ -533,25 +533,40 @@ void IRAM_ATTR keyenceResultIsr() {
 // -- parseRmResponse() below tries both candidate offsets and locks onto
 // whichever one validates against the address/count actually requested.
 //
-// FIELD REPORT (2026-09): on real hardware this offset-guessing approach
-// has NEVER actually worked -- 2968/2968 RM read attempts returned bytes
-// that parsed at neither offset (0 successes, 0 timeouts, all parse
-// errors), while WM writes appear to be going out fine. The archived
-// bench-tested file this was ported from claimed non-blocking RM reads as
-// "confirmed working," but that claim was evidently never true for the
-// response-parsing path specifically (only the ESC-byte-for-WM and 9600-
-// baud findings have independent corroborating evidence). Since neither
-// candidate offset has ever validated, parseRmResponse() below now dumps
-// the raw rejected line on every failure so the real framing can be read
-// off directly instead of guessed at again.
+// FIELD REPORT (2026-09, round 1): on real hardware this offset-guessing
+// approach has NEVER actually worked -- 2968/2968 RM read attempts
+// returned bytes that parsed at neither offset (0 successes, 0 timeouts,
+// all parse errors), while WM writes appear to be going out fine.
+//
+// FIELD REPORT (round 2, with the raw-dump-on-failure added below): the
+// captured raw bytes are consistently, reproducibly `ESC 'W' 'M' '0' '0'
+// '1' 'F'` (7 bytes) every single time. This is NOT shaped like an RM
+// response at all -- it starts with 'W','M' (our own WM-write command
+// signature), not 'R','M', so parseRmResponse() rejects it on its very
+// first check, before either candidate offset is even tried. The offset
+// guess was never the actual bug. What's arriving on RX while we wait for
+// an RM reply looks like a fragment of our own outgoing traffic, most
+// plausibly explained by either (a) a hardware TX/RX loopback/echo on the
+// NS12 link, or (b) a WM write firing on the shared UART while an RM read
+// is still pending and getting vacuumed into the read buffer by
+// pollPendingRead(), which doesn't verify a byte's origin, only that it
+// starts at an ESC. requestRM() now refuses to fire while readPending is
+// already true (unchanged), and sendWM() now defers a telemetry write
+// rather than firing while a read is pending, to remove (b) as a variable.
+// If the bogus "response" still appears after that, (a) -- a genuine
+// wiring/echo issue -- is the remaining explanation and needs a bench
+// check (verify NS12_RX is only ever driven by HIN232CP R1OUT, never
+// bridged to NS12_TX, and check whether the PT itself echoes received
+// characters despite CX-Designer's "Response = OFF" setting).
 // =====================================================================
 
 // Set to 1 for a full TX/RX byte trace on the Serial monitor (verbose --
-// every WM/RM byte). Off by default; flip on temporarily while chasing a
-// link problem. The RM parse-failure dump below is unconditional and
-// separate from this, since that specific failure needs visibility by
-// default, not just when this is enabled.
-#define NS12_DEBUG_RAW_RX 0
+// every WM/RM byte). Temporarily ON by default while the mystery above is
+// unresolved -- turn back to 0 once the loopback/interleaving question is
+// settled, since it adds real per-byte overhead and console noise. The RM
+// parse-failure dump below is unconditional and separate from this, since
+// that specific failure needs visibility regardless of this flag.
+#define NS12_DEBUG_RAW_RX 1
 
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
@@ -719,7 +734,16 @@ public:
   void service() {
     uint32_t now = millis();
 
-    if (now - lastTelemetryMs >= NS12::TELEMETRY_WRITE_INTERVAL_MS) {
+    // Deliberately gated on !readPending: RM_READ_TIMEOUT_MS and
+    // TELEMETRY_WRITE_INTERVAL_MS are both 250-300ms, so a telemetry WM
+    // write could otherwise fire in the middle of an in-flight RM read on
+    // this shared half-visible UART. pollPendingRead() only checks that a
+    // byte stream starts at an ESC, not where it actually came from -- see
+    // the field-report comment on the NS12 namespace for why that matters
+    // (every captured "RM response" so far has actually had a WM-shaped
+    // header). This delays telemetry by at most one RM_READ_TIMEOUT_MS
+    // window, not lost -- it fires on the next service() call instead.
+    if (!readPending && now - lastTelemetryMs >= NS12::TELEMETRY_WRITE_INTERVAL_MS) {
       lastTelemetryMs = now;
       sendWM(NS12::TELEMETRY_BASE_ADDR, telemetry, NS12::TELEMETRY_WORD_COUNT);
     }
@@ -756,6 +780,12 @@ public:
   uint32_t wmAttemptCount() const { return wmAttempts; }
   uint32_t wmFailureCount() const { return wmFailures; }
   void resetRmStats() { rmAttempts = 0; rmSuccesses = 0; }
+
+  // Exposed so the matrix-push free functions (serviceDisplayThrottle(),
+  // serviceMatrixPacing()) can defer a WM write the same way service()
+  // defers telemetry -- see the field-report comment on the NS12
+  // namespace for why a WM write during a pending RM read is suspect.
+  bool isReadPending() const { return readPending; }
 
 private:
   uint16_t telemetry[NS12::TELEMETRY_WORD_COUNT] = {};
@@ -806,6 +836,16 @@ private:
       printRawByteAlways((uint8_t)line[i]);
     }
     Serial.println();
+    // Flag explicitly rather than making the reader notice: a genuine RM
+    // reply starts 'R','M'. If it starts 'W','M' instead, this isn't a PT
+    // response at all -- it's shaped like one of OUR OWN WM writes, most
+    // likely a loopback/echo or a write that fired while this read was
+    // still pending. See the field-report comment on the NS12 namespace.
+    if (len >= 3 && line[1] == 'W' && line[2] == 'M') {
+      Serial.println(F("[NS12]   ^ starts 'W','M', not 'R','M' -- looks like "
+                        "our own WM traffic, not a genuine RM reply. Check "
+                        "for TX/RX loopback or PT echo."));
+    }
   }
 
   static void printRawByteAlways(uint8_t value) {
@@ -1056,6 +1096,7 @@ void pushWordLampMatrix(const float *compositeFrame) {
 // elapsed.
 void serviceDisplayThrottle() {
   if (!displayPushQueued) return;
+  if (ns12.isReadPending()) return; // defer -- see field-report comment on NS12 namespace
   uint32_t now = millis();
   if (now - lastDisplayPushMs < currentDisplayRefreshMs) return;
   lastDisplayPushMs = now;
@@ -1066,6 +1107,7 @@ void serviceDisplayThrottle() {
 // Called every loop() iteration; no-op unless a paced 32x24 push is active.
 void serviceMatrixPacing() {
   if (!pendingMatrix.active) return;
+  if (ns12.isReadPending()) return; // defer -- see field-report comment on NS12 namespace
   uint32_t now = millis();
   if (now - pendingMatrix.lastWriteMs < NS12::COLUMN_WRITE_INTERVAL_MS) return;
   pendingMatrix.lastWriteMs = now;
