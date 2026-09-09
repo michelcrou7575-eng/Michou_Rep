@@ -1,15 +1,36 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_14.0
+// Ref: TGIS-510_cpp_V4_15.0
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
 //
-// CLEAN-ROOM NOTE: this file was written directly from a project handoff
-// synthesis, not by editing an existing tgis510_v4_14_0.cpp. Neither that
-// file nor the earlier HotMelt_MLX90640_80032_9_8_0.cpp snapshot were
-// available in the environment this was written in. Diff this against
-// whatever is actually on disk at "C:/Users/Admin/Documents/PlatformIO/
-// Projects/510 HotMelt Monitor/" before flashing to real hardware.
+// MERGE NOTE (V4.15.0): the prior V4.14.0 revision of this file was written
+// from a project handoff synthesis without access to the actual bench-tested
+// firmware, and explicitly flagged its own NS12 wire-protocol implementation
+// and 38400-baud claim as unverified ("diff this against whatever is
+// actually on disk... before flashing to real hardware"). That protocol
+// layer has been replaced here with the one from the actual bench-tested
+// HotMelt_MLX90640_80032_9_8_1.cpp snapshot, which documents specific,
+// falsifiable bench results (9600 baud measured zero RM timeouts vs ~15% at
+// 38400; the ESC=0x1B-for-WM quirk found via live sensor data and a test
+// pattern both landing correctly on the physical screen). Where the two
+// files disagreed, the version with documented bench evidence won. Board
+// diagnostics (I2C scanner, board info), camera-recovery-on-repeated-
+// failure, real windowed FPS measurement, an RGB status LED, an ESP task
+// watchdog, and the $W0-$W8 telemetry block were all restored from that
+// same bench-tested file -- V4.14.0 had dropped them.
+//
+// Kept from V4.14.0 (real forward progress, not present in the older
+// snapshot): encoder position tracking (PCNT), Keyence IV2 trigger/result
+// handling, tube presence sensor edge detection, forward-projection tube
+// timing, per-strip (strip1/strip2) glue QC evaluation, velocity-adaptive
+// HMI display throttling, and the column-paced experimental 32x24 HMI mode
+// with an RM-success-rate auto-fallback (whose pacing interval and read
+// path are both fixed here -- see the NS12 namespace and NS12Manager).
+//
+// STILL UNVERIFIED ON REAL HARDWARE: this merge has not itself been bench
+// tested. Re-verify the NS12 link (baud, ESC byte, frame framing) and the
+// Action-Item placeholder pins below before flashing to the real machine.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -32,6 +53,8 @@
 #include <Wire.h>
 #include <Adafruit_MLX90640.h>
 #include <Adafruit_MCP23X17.h>
+#include <Adafruit_NeoPixel.h>
+#include <esp_task_wdt.h>
 #include "driver/pcnt.h"
 
 // =====================================================================
@@ -40,13 +63,20 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.14.0"
+#define FW_VERSION_STRING "V4.15.0"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_14_0.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_0.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
+
+// Watchdog: recovers from a hung control loop (e.g. a stalled NS12 link)
+// instead of leaving fast-stop/interlock outputs stuck indefinitely.
+static const uint32_t WATCHDOG_TIMEOUT_S = 3;
+
+// Periodic Serial diagnostic report cadence.
+static const uint32_t DIAGNOSTIC_INTERVAL_MS = 1000;
 
 // =====================================================================
 // PIN CONFIG
@@ -60,6 +90,10 @@ constexpr uint8_t I2C_SDA = 8;
 constexpr uint8_t I2C_SCL = 9;
 constexpr uint8_t NS12_TX = 43;
 constexpr uint8_t NS12_RX = 44;
+
+// Waveshare ESP32-S3-Zero onboard WS2812 RGB LED -- confirmed board
+// feature (not a wiring guess like the placeholders below).
+constexpr uint8_t RGB_LED = 21;
 
 // PLACEHOLDER -- bench-verify against silkscreen (Action Item 1)
 constexpr uint8_t ENCODER_PULSE_PIN = 4;
@@ -84,21 +118,163 @@ constexpr uint8_t KEYENCE_RESULT_PIN = 7;
 // =====================================================================
 static const uint32_t I2C_CLOCK_HZ = 800000UL;
 
+bool isI2CAddressPresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+// =====================================================================
+// Onboard RGB status LED.
+// =====================================================================
+Adafruit_NeoPixel statusLed(1, Pins::RGB_LED, NEO_RGB + NEO_KHZ800);
+
+void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
+  statusLed.setPixelColor(0, statusLed.Color(red, green, blue));
+  statusLed.show();
+}
+
+// =====================================================================
+// Board / I2C bring-up diagnostics -- run once at startup.
+// =====================================================================
+void printBoardInformation() {
+  Serial.println();
+  Serial.println(F("CONTROLLER INFORMATION"));
+  Serial.println(F("----------------------------------------------------"));
+  Serial.printf("CPU frequency      : %u MHz\n", ESP.getCpuFreqMHz());
+  Serial.printf("Flash size         : %.1f kB\n", ESP.getFlashChipSize() / 1024.0f);
+  Serial.printf("Free heap          : %.1f kB\n", ESP.getFreeHeap() / 1024.0f);
+  Serial.printf("PSRAM detected     : %s\n", psramFound() ? "YES" : "NO");
+}
+
+void runI2CScanner() {
+  Serial.println();
+  Serial.println(F("I2C SCANNER"));
+  Serial.println(F("----------------------------------------------------"));
+  uint8_t deviceCount = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    if (isI2CAddressPresent(address)) {
+      Serial.printf("Device found       : 0x%02X\n", address);
+      deviceCount++;
+    }
+  }
+  if (deviceCount == 0) {
+    Serial.println(F("No I2C devices found."));
+  } else {
+    Serial.printf("Total devices      : %u\n", deviceCount);
+  }
+}
+
 // =====================================================================
 // MLX90640
-// 32Hz is the confirmed-stable *nominal* refresh ceiling at 800kHz, but
-// measured actual throughput on this hardware is ~8 FPS. All downstream
-// timing math uses the measured rate, not the nominal one. 64Hz fails with
-// error -8 here -- an I2C bandwidth wall (64Hz needs ~196KB/s vs ~100KB/s
-// usable at 800kHz), not a timing bug.
+// 32Hz is the confirmed-stable *nominal* refresh ceiling at 800kHz, and
+// MLX_FRAME_PERIOD_MS below (derived from MLX_MEASURED_FPS) only paces how
+// often loop() asks the sensor for a frame -- it is a fixed assumption, not
+// a live measurement. The actual windowed measurement lives at runtime in
+// `measuredFramesPerSecond` (see updateFrameRate()) and is what diagnostics
+// / HMI telemetry report. 64Hz fails with error -8 here -- an I2C
+// bandwidth wall (64Hz needs ~196KB/s vs ~100KB/s usable at 800kHz), not a
+// timing bug.
 // =====================================================================
 static const mlx90640_refreshrate_t MLX_REFRESH_RATE_NOMINAL = MLX90640_32_HZ;
 static const float MLX_MEASURED_FPS = 8.0f;
 static const uint32_t MLX_FRAME_PERIOD_MS = (uint32_t)(1000.0f / MLX_MEASURED_FPS); // 125ms
 
-// PLACEHOLDER (Action Item 5): bench-test value was 20-40C (hand
-// visibility). Real production range is 20.0-180.0C. Confirm this is set
-// before running against real hot melt.
+Adafruit_MLX90640 mlx;
+float mlxFrame[32 * 24];
+
+bool mlxDetected = false;
+bool mlxInitialized = false;
+bool lastFrameValid = false;
+uint32_t successfulFrameCount = 0;
+uint32_t failedFrameCount = 0;
+uint8_t consecutiveFrameFailures = 0;
+constexpr uint8_t FRAME_FAILURE_RECOVERY_COUNT = 5;
+
+float minimumTemperatureC = NAN;
+float maximumTemperatureC = NAN;
+float averageTemperatureC = NAN;
+
+float measuredFramesPerSecond = 0.0f;
+uint32_t fpsWindowStartMs = 0;
+uint32_t fpsWindowFrameCount = 0;
+
+void calculateFrameStatistics() {
+  float sumC = 0.0f;
+  float minC = INFINITY;
+  float maxC = -INFINITY;
+  uint16_t validCount = 0;
+
+  for (size_t i = 0; i < 32 * 24; i++) {
+    float t = mlxFrame[i];
+    if (!isfinite(t)) continue;
+    if (t < minC) minC = t;
+    if (t > maxC) maxC = t;
+    sumC += t;
+    validCount++;
+  }
+
+  if (validCount > 0) {
+    minimumTemperatureC = minC;
+    maximumTemperatureC = maxC;
+    averageTemperatureC = sumC / (float)validCount;
+  } else {
+    minimumTemperatureC = NAN;
+    maximumTemperatureC = NAN;
+    averageTemperatureC = NAN;
+  }
+}
+
+void updateFrameRate() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - fpsWindowStartMs;
+  if (elapsed >= 2000UL) {
+    measuredFramesPerSecond = (float)fpsWindowFrameCount * 1000.0f / (float)elapsed;
+    fpsWindowStartMs = now;
+    fpsWindowFrameCount = 0;
+  }
+}
+
+bool initializeMlx() {
+  if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+    return false;
+  }
+  mlx.setMode(MLX90640_CHESS);
+  mlx.setResolution(MLX90640_ADC_18BIT);
+  mlx.setRefreshRate(MLX_REFRESH_RATE_NOMINAL);
+  return true;
+}
+
+void attemptCameraRecovery() {
+  Serial.println();
+  Serial.println(F("CAMERA RECOVERY"));
+  Serial.println(F("----------------------------------------------------"));
+  Serial.println(F("5 consecutive frame reads failed -- reinitializing I2C + MLX90640."));
+
+  mlxInitialized = false;
+  consecutiveFrameFailures = 0;
+
+  Wire.end();
+  delay(50);
+  Wire.begin(Pins::I2C_SDA, Pins::I2C_SCL);
+  Wire.setClock(I2C_CLOCK_HZ);
+  Wire.setTimeOut(1000);
+  delay(50);
+
+  mlxDetected = isI2CAddressPresent(MLX90640_I2CADDR_DEFAULT);
+  if (mlxDetected) {
+    mlxInitialized = initializeMlx();
+  }
+
+  if (mlxInitialized) {
+    Serial.println(F("Camera recovery successful."));
+    setStatusLed(0, 25, 0);
+  } else {
+    Serial.println(F("Camera recovery failed."));
+    setStatusLed(30, 0, 0);
+  }
+}
+
+// PLACEHOLDER (Action Item 5): confirmed production range 20.0-180.0C.
 static const float MATRIX_TEMP_MIN_C = 20.0f;
 static const float MATRIX_TEMP_MAX_C = 180.0f;
 
@@ -110,9 +286,6 @@ static const float CAPTURE_TRIGGER_TEMP_C = 30.0f;
 // PLACEHOLDER (Action Item 7): needs real 200 m/min validation. Tuning knob
 // for "does one sampling window match one tube's FOV transit".
 static const uint8_t CAPTURE_SAMPLE_COUNT = 4;
-
-Adafruit_MLX90640 mlx;
-float mlxFrame[32 * 24];
 
 // =====================================================================
 // Timing constraint (critical, unresolved):
@@ -289,31 +462,40 @@ void IRAM_ATTR keyenceResultIsr() {
 
 // =====================================================================
 // NS12 HMI / Memory Link protocol
-// Ref: Omron NS-Series Host Connection Manual (Cat. No. V085-E1-07), S3.
-// Commands: WM (write $W), RM (read $W). WN/RN don't apply (NT31/NT631
-// only).
+// Ref: Omron NS-Series Host Connection Manual (Cat. No. V085-E1-07), S3
+// "Connection via Memory Link". Confirmed applicable to this NS12-TS00B-V2
+// unit's Memory Link mode. Commands: WM (write $W), RM (read $W).
 //
-// Firmware quirk on this specific PT unit: ESC=0x1B is used for *every*
-// command including WM, not the manual's documented 0x1C for word writes.
-// Using 0x1C per spec caused every WM write to be silently ignored --
-// already-fixed root cause of an early blank-screen bug.
+// Frame layout (all ASCII). *S='0' selects SUM (checksum) OFF + SET-write /
+// variable-length read -- no checksum byte is appended, which is only
+// valid because *S explicitly says SUM is off:
+//   Write : ESC 'W' 'M' '0' AAAA(4-hex addr) LL(2-dec count)
+//           D,D,...(comma-separated hex, zero-suppressed) CR
+//   Read  : ESC 'R' 'M' '0' AAAA(4-hex addr) LL(2-dec count) CR
+//   Read response: ESC 'R' 'M' [maybe '0' echoed] AAAA LL D,D,... CR
 //
-// Baud: 38400 is the confirmed-working, current source of truth. (Stale
-// header comments/constants elsewhere may say 9600 or 19200 -- code
-// constants win over comments when they conflict, per project convention.)
+// CONFIRMED ON BENCH -- do not "fix" either of these back without
+// re-testing on real hardware:
+//   - ESC=0x1B is used for *every* command on this PT unit, including WM.
+//     The manual documents 0x1C specifically for WM/WD (word writes); this
+//     unit's firmware does not honor that distinction and silently ignores
+//     every WM write sent with 0x1C. Switching WM to 0x1B fixed it
+//     immediately, confirmed via live sensor data and a known test pattern
+//     both landing correctly on the physical screen.
+//   - 9600 baud. 38400 measured ~15% RM read timeouts on this exact bench
+//     setup; 9600 measured zero. A prior synthesis of this file (V4.14.0)
+//     asserted 38400 as "confirmed" without ever having bench access to
+//     verify it against the real unit -- that claim is not trusted here.
 //
-// TX=GPIO43, RX=GPIO44, 8N1, via HIN232CP (confirmed -9V/+8V swing).
-//
-// The exact FCS checksum byte layout for this PT's Memory Link responses
-// has not been independently verified against the manual on real hardware
-// (this unit already has >=1 undocumented protocol deviation -- the ESC
-// byte). The 8-bit XOR checksum below is a best-effort placeholder;
-// bench-verify against real WM/RM traffic before trusting it blindly.
+// The exact RM response framing (whether *S is echoed back, shifting the
+// address field by one byte) has not been independently pinned down either
+// -- parseRmResponse() below tries both candidate offsets and locks onto
+// whichever one validates against the address/count actually requested.
 // =====================================================================
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
-constexpr long BAUD = 38400; // confirmed source of truth -- do not "fix" back to 9600/19200
-constexpr uint32_t RM_READ_TIMEOUT_MS = 250; // widened from 120ms after heavier matrix traffic delayed replies
+constexpr long BAUD = 9600; // CONFIRMED bench value -- see header note above
+constexpr uint32_t RM_READ_TIMEOUT_MS = 250;
 
 // Word Lamp matrix -- default/trusted mode, 16x8 grid at $W700-$W827,
 // column-major, stride 8: address(col,row) = 700 + col*8 + row.
@@ -324,49 +506,56 @@ constexpr uint8_t MATRIX_ROWS_DEFAULT = 8;
 // Full 32x24 push previously caused 100% NS12 read-request failure
 // (0/424 reads OK) -- the PT couldn't service RM reads while absorbing
 // that write load. Reverted to 16x8. A later column-paced 32x24 mode is
-// kept here as opt-in/experimental (ENABLE_EXPERIMENTAL_32x24 below),
-// flagged in the latest code audit as needing close monitoring -- not yet
-// fully trusted. It self-monitors RM failure rate and auto-reverts to
-// 16x8 if that spikes (see NS12Manager::checkAutoFallback()).
+// kept here as opt-in/experimental, self-monitored: it auto-reverts to
+// 16x8 if RM success rate collapses (see checkDisplayAutoFallback()).
 constexpr bool ENABLE_EXPERIMENTAL_32x24 = false;
 constexpr uint8_t MATRIX_COLS_EXPERIMENTAL = 32;
 constexpr uint8_t MATRIX_ROWS_EXPERIMENTAL = 24;
 
-// Word Lamp palette: 10 entries, index 0-9. Index 0 renders as blank/off
-// -- clamp the coldest output to index 1, never 0, to avoid the
-// "writes succeed, nothing shows" bug this caused previously.
+// Word Lamp palette: 10 entries, index 0-9. Index 0 renders as blank/off on
+// this PT -- clamp the coldest output to index 1, never 0, so a write
+// always shows something.
 constexpr uint8_t PALETTE_MIN_INDEX = 1;
 constexpr uint8_t PALETTE_MAX_INDEX = 9;
 
 // Display refresh decoupled from live camera streaming, velocity-adaptive
-// per-tube throttle.
+// per-tube throttle (floor only -- see requestDisplayPush()).
 constexpr uint32_t TARGET_DISPLAY_REFRESH_MS = 2000;
 
+// Telemetry block $W0-$W8 -- operator/PLC visibility into system health.
+// V4.14.0 dropped this entirely; restored from the bench-tested file.
+constexpr uint16_t TELEMETRY_BASE_ADDR = 0;
+constexpr uint16_t TELEMETRY_WORD_COUNT = 9;
+constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
+
+// Low-rate read used only to keep the auto-fallback's RM success-rate
+// stats alive (see checkDisplayAutoFallback()) -- without some RM traffic
+// those stats never move and the fallback can never trigger. Mirrors the
+// bench-tested file's $W10 "operator test input" convention; repoint if
+// the CX-Designer project already uses $W10 for something else.
+constexpr uint16_t TEST_READ_ADDR = 10;
+constexpr uint32_t TEST_READ_INTERVAL_MS = 300;
+
 // Largest single WM burst used anywhere (the 16x8 default matrix: 128
-// words). The experimental 32x24 mode never writes more than one column
-// (24 words) per WM command -- see the column-paced mechanism below --
-// which is what "column-paced" is meant to buy: no single write big enough
-// to starve the PT's ability to service RM reads, unlike the old one-shot
-// 768-word push that caused 0/424 RM failures.
+// words). Also sizes the sendWM() stack buffer.
 constexpr uint16_t MAX_WM_WORDS = 128;
 
 // Spacing between successive column writes in the experimental 32x24 mode.
 //
-// BANDWIDTH FIX (was a fixed 15ms guess): one column WM frame is
-// ESC+'W'+'M' (3) + 4-digit decimal address (4) + rows*4 hex data digits +
-// 2-digit hex FCS (2) + CR (1) bytes. At MATRIX_ROWS_EXPERIMENTAL=24 that's
-// 106 bytes; at 8N1 (10 bits/byte) and BAUD=38400 that takes ~27.6ms to
-// physically drain off the wire. The old fixed 15ms interval issued a new
-// column write before the previous one had finished transmitting -- the
-// same "PT starved mid-write" failure mode column-pacing exists to avoid,
-// just recurring at smaller scale: it would silently build an ever-growing
-// TX backlog under sustained use instead of actually pacing anything.
-// Computed from the real frame size and baud with a 50% margin so it stays
+// Derived, not guessed: one column WM frame is ESC+'W'+'M'+'0' (4) +
+// 4-hex address (4) + 2-decimal count (2) + comma-separated hex data
+// (rows values, each 1 digit since palette indices are 0-9, plus
+// rows-1 commas) + CR (1). At MATRIX_ROWS_EXPERIMENTAL=24 that's 58 bytes;
+// at 8N1 (10 bits/byte) and BAUD=9600 that takes ~60.4ms to physically
+// drain off the wire. A fixed interval shorter than that would issue a new
+// column write before the previous one finished transmitting -- the same
+// "PT starved mid-write" failure mode column-pacing exists to avoid, just
+// recurring at smaller scale. Computed with a 50% margin so it stays
 // correct if BAUD or MATRIX_ROWS_EXPERIMENTAL ever change.
+constexpr uint16_t COLUMN_DATA_CHARS =
+    (uint16_t)MATRIX_ROWS_EXPERIMENTAL + ((uint16_t)MATRIX_ROWS_EXPERIMENTAL - 1);
 constexpr uint16_t COLUMN_FRAME_BYTES =
-    3 /*ESC W M*/ + 4 /*decimal addr*/ +
-    (uint16_t)MATRIX_ROWS_EXPERIMENTAL * 4 /*hex data*/ +
-    2 /*hex fcs*/ + 1 /*CR*/;
+    4 /*ESC W M '0'*/ + 4 /*hex addr*/ + 2 /*dec count*/ + COLUMN_DATA_CHARS + 1 /*CR*/;
 constexpr uint32_t COLUMN_FRAME_TX_TIME_US =
     (uint32_t)COLUMN_FRAME_BYTES * 10UL * 1000000UL / (uint32_t)BAUD;
 constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
@@ -376,155 +565,247 @@ constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
 class NS12Manager {
 public:
   void begin() {
-    // setTxBufferSize() must precede begin() on the ESP32 Arduino core.
     Serial2.setTxBufferSize(1024);
     Serial2.begin(NS12::BAUD, SERIAL_8N1, Pins::NS12_RX, Pins::NS12_TX);
+    lastTelemetryMs = millis();
+    lastTestReadMs = millis();
   }
 
   // WM: write `count` words starting at `startAddr`. `count` is clamped to
-  // NS12::MAX_WM_WORDS -- callers must stay within that (the 16x8 burst and
-  // single-column experimental writes both do).
+  // NS12::MAX_WM_WORDS -- callers must stay within that (the 16x8 burst,
+  // telemetry block, and single-column experimental writes all do).
   void sendWM(uint16_t startAddr, const uint16_t *data, uint16_t count) {
     if (count > NS12::MAX_WM_WORDS) count = NS12::MAX_WM_WORDS;
-    uint8_t frame[3 + 4 + 4 * NS12::MAX_WM_WORDS + 2 + 1];
+    char frame[4 + 4 + 2 + NS12::MAX_WM_WORDS * 5 + 1];
     size_t n = 0;
-    frame[n++] = NS12::ESC;
+    frame[n++] = (char)NS12::ESC;
     frame[n++] = 'W';
     frame[n++] = 'M';
-    n += writeDecimal4(&frame[n], startAddr);
+    frame[n++] = '0';
+    n += writeHex4(&frame[n], startAddr);
+    n += writeDecimal2(&frame[n], (uint8_t)count);
     for (uint16_t i = 0; i < count; i++) {
-      n += writeHex4(&frame[n], data[i]);
+      if (i > 0) frame[n++] = ',';
+      n += writeHexCompact(&frame[n], data[i]);
     }
-    uint8_t fcs = computeFcs(frame, n);
-    n += writeHex2(&frame[n], fcs);
     frame[n++] = '\r';
 
     wmAttempts++;
-    size_t sent = Serial2.write(frame, n);
+    size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
     if (sent != n) {
-      // Partial write -- the PT never got a complete, valid frame. Nothing
-      // downstream checked this before, so a write silently dropped under
-      // TX backlog looked identical to a write that landed cleanly.
+      // Partial write -- the PT never got a complete, valid frame. Left
+      // uncounted before, this made a write silently dropped under TX
+      // backlog indistinguishable from one that landed cleanly.
       wmFailures++;
     }
-    // Blocking flush() intentionally removed from WM writes (kept for RM
-    // reads) -- a stalled TX flush here would block the whole control loop
-    // during InspectingTube.
+    // Blocking flush() intentionally not used for WM -- a stalled TX flush
+    // here would block the whole control loop during InspectingTube.
   }
 
-  // RM: read `count` words starting at `startAddr`. Returns true on a
-  // well-formed response within timeout.
-  bool sendRM(uint16_t startAddr, uint8_t count, uint16_t *out) {
-    uint8_t frame[16];
+  // RM: request `count` words (max 32) starting at `startAddr`. Sends the
+  // request only and returns immediately -- non-blocking, unlike the prior
+  // synthesis's spin-wait version, which could stall the whole loop for up
+  // to RM_READ_TIMEOUT_MS at a time this file now also drives hard-real-
+  // time Keyence pulse timing and encoder tracking. Call service() every
+  // loop() iteration to drive the response state machine.
+  bool requestRM(uint16_t startAddr, uint8_t count) {
+    if (readPending || count == 0 || count > 32) return false;
+
+    char frame[16];
     size_t n = 0;
-    frame[n++] = NS12::ESC;
+    frame[n++] = (char)NS12::ESC;
     frame[n++] = 'R';
     frame[n++] = 'M';
-    n += writeDecimal4(&frame[n], startAddr);
+    frame[n++] = '0';
+    n += writeHex4(&frame[n], startAddr);
     n += writeDecimal2(&frame[n], count);
-    uint8_t fcs = computeFcs(frame, n);
-    n += writeHex2(&frame[n], fcs);
     frame[n++] = '\r';
 
     rmAttempts++;
-    size_t sent = Serial2.write(frame, n);
+    clearRxBuffer();
+    size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
     if (sent != n) {
       // Request itself never fully went out -- don't burn the full
       // RM_READ_TIMEOUT_MS waiting on a reply to a frame the PT never saw.
       rmWriteFailures++;
       return false;
     }
-    Serial2.flush(); // RM reads keep the blocking flush -- WM writes do not.
+    Serial2.flush(); // request frame is <=11 bytes -- flush cost here is negligible
 
-    bool ok = pollRead(count, out, NS12::RM_READ_TIMEOUT_MS);
-    if (ok) {
-      rmSuccesses++;
+    readPending = true;
+    readSentMs = millis();
+    readLineUsed = 0;
+    expectedAddr = startAddr;
+    expectedCount = count;
+    return true;
+  }
+
+  // Must be called every loop() iteration. Drives the periodic telemetry
+  // push, the periodic low-rate test read, and the non-blocking read
+  // state machine. Never blocks.
+  void service() {
+    uint32_t now = millis();
+
+    if (now - lastTelemetryMs >= NS12::TELEMETRY_WRITE_INTERVAL_MS) {
+      lastTelemetryMs = now;
+      sendWM(NS12::TELEMETRY_BASE_ADDR, telemetry, NS12::TELEMETRY_WORD_COUNT);
     }
-    return ok;
+
+    if (!readPending && (now - lastTestReadMs >= NS12::TEST_READ_INTERVAL_MS)) {
+      lastTestReadMs = now;
+      requestRM(NS12::TEST_READ_ADDR, 1);
+    }
+
+    if (readPending) {
+      pollPendingRead(now);
+    }
+  }
+
+  void setTelemetry(uint16_t heartbeat, uint16_t fpsX10, uint16_t minX10, uint16_t maxX10,
+                     uint16_t avgX10, uint16_t goodFrames, uint16_t badFrames,
+                     uint16_t stateValue, uint16_t statusWord) {
+    telemetry[0] = heartbeat;
+    telemetry[1] = fpsX10;
+    telemetry[2] = minX10;
+    telemetry[3] = maxX10;
+    telemetry[4] = avgX10;
+    telemetry[5] = goodFrames;
+    telemetry[6] = badFrames;
+    telemetry[7] = stateValue;
+    telemetry[8] = statusWord;
   }
 
   uint32_t rmAttemptCount() const { return rmAttempts; }
   uint32_t rmSuccessCount() const { return rmSuccesses; }
   uint32_t rmWriteFailureCount() const { return rmWriteFailures; }
+  uint32_t rmTimeoutCount() const { return rmTimeouts; }
+  uint32_t rmParseErrorCount() const { return rmParseErrors; }
   uint32_t wmAttemptCount() const { return wmAttempts; }
   uint32_t wmFailureCount() const { return wmFailures; }
   void resetRmStats() { rmAttempts = 0; rmSuccesses = 0; }
 
 private:
+  uint16_t telemetry[NS12::TELEMETRY_WORD_COUNT] = {};
+  uint32_t lastTelemetryMs = 0;
+  uint32_t lastTestReadMs = 0;
+
+  bool readPending = false;
+  uint32_t readSentMs = 0;
+  uint16_t expectedAddr = 0;
+  uint8_t expectedCount = 0;
+  char readLineBuffer[40] = {};
+  size_t readLineUsed = 0;
+
   uint32_t rmAttempts = 0;
   uint32_t rmSuccesses = 0;
   uint32_t rmWriteFailures = 0;
+  uint32_t rmTimeouts = 0;
+  uint32_t rmParseErrors = 0;
   uint32_t wmAttempts = 0;
   uint32_t wmFailures = 0;
 
-  // Resyncs to the next ESC byte rather than trusting byte 0 == frame
-  // start, discarding stray bytes instead of corrupting the response.
-  bool pollRead(uint8_t wordCount, uint16_t *out, uint32_t timeoutMs) {
-    uint32_t start = millis();
-    // Discard until ESC.
-    while ((millis() - start) < timeoutMs) {
-      if (Serial2.available()) {
-        if (Serial2.peek() == NS12::ESC) break;
-        Serial2.read();
+  void clearRxBuffer() {
+    while (Serial2.available() > 0) Serial2.read();
+  }
+
+  // Non-blocking poll: consumes whatever bytes are currently available
+  // without waiting. Completes the pending read only once a full line
+  // (terminated by CR) has arrived, or aborts it on timeout/overflow.
+  void pollPendingRead(uint32_t now) {
+    while (Serial2.available() > 0 && readLineUsed < sizeof(readLineBuffer) - 1) {
+      char ch = (char)Serial2.read();
+
+      // A genuine RM response always starts with ESC. Anything arriving
+      // before that first ESC is stray (e.g. overlap with a WM write) and
+      // is discarded rather than corrupting the line.
+      if (readLineUsed == 0 && (uint8_t)ch != NS12::ESC) {
+        continue;
       }
-    }
-    if (!Serial2.available() || Serial2.peek() != NS12::ESC) return false;
-    Serial2.read(); // consume ESC
 
-    // Expect two status/command echo bytes, then wordCount*4 hex digits,
-    // then 2 hex FCS digits, then CR.
-    uint8_t buf[2 + 4 * 32 + 2 + 1];
-    size_t need = 2 + (size_t)wordCount * 4 + 2 + 1;
-    size_t got = 0;
-    while (got < need && (millis() - start) < timeoutMs) {
-      if (Serial2.available()) {
-        buf[got++] = Serial2.read();
+      if (ch == '\r') {
+        readLineBuffer[readLineUsed] = '\0';
+        if (parseRmResponse(readLineBuffer, readLineUsed)) {
+          rmSuccesses++;
+        } else {
+          rmParseErrors++;
+        }
+        readPending = false;
+        return;
       }
-    }
-    if (got < need) return false;
 
-    char hex[5];
-    hex[4] = '\0';
-    for (uint8_t i = 0; i < wordCount; i++) {
-      hex[0] = (char)buf[2 + i * 4];
-      hex[1] = (char)buf[3 + i * 4];
-      hex[2] = (char)buf[4 + i * 4];
-      hex[3] = (char)buf[5 + i * 4];
-      out[i] = (uint16_t)strtol(hex, nullptr, 16);
+      readLineBuffer[readLineUsed++] = ch;
     }
-    return true;
+
+    if (!readPending) return; // completed above
+
+    if (readLineUsed >= sizeof(readLineBuffer) - 1) {
+      rmParseErrors++;
+      readPending = false;
+      return;
+    }
+
+    if (now - readSentMs > NS12::RM_READ_TIMEOUT_MS) {
+      rmTimeouts++;
+      readPending = false;
+    }
   }
 
-  static size_t writeDecimal4(uint8_t *dst, uint16_t v) {
-    char tmp[5];
-    snprintf(tmp, sizeof(tmp), "%04u", v);
-    memcpy(dst, tmp, 4);
-    return 4;
+  // Response framing: ESC 'R' 'M' [maybe '0' echoed] AAAA(4-hex)
+  // LL(2-dec) D,D,... CR. The '0' echo has not been independently
+  // confirmed on this PT, so both candidate offsets are tried; whichever
+  // validates against the address/count actually requested wins.
+  bool parseRmResponse(const char *response, size_t len) {
+    if (len < 9 || (uint8_t)response[0] != NS12::ESC || response[1] != 'R' || response[2] != 'M') {
+      return false;
+    }
+
+    static const uint8_t candidateOffsets[] = {3, 4};
+    for (uint8_t offset : candidateOffsets) {
+      size_t headerLen = (size_t)offset + 6;
+      if (len < headerLen) continue;
+
+      char addrText[5] = {response[offset], response[offset + 1], response[offset + 2],
+                          response[offset + 3], '\0'};
+      char countText[3] = {response[offset + 4], response[offset + 5], '\0'};
+      uint16_t addr = (uint16_t)strtoul(addrText, nullptr, 16);
+      uint8_t count = (uint8_t)strtoul(countText, nullptr, 10);
+      if (addr != expectedAddr || count != expectedCount) continue;
+
+      char dataText[8];
+      size_t dataLen = len - headerLen;
+      if (dataLen == 0 || dataLen >= sizeof(dataText)) continue;
+      memcpy(dataText, &response[headerLen], dataLen);
+      dataText[dataLen] = '\0';
+      char *comma = strchr(dataText, ',');
+      if (comma) *comma = '\0';
+
+      char *endPtr = nullptr;
+      strtoul(dataText, &endPtr, 16);
+      if (endPtr == dataText) continue;
+      return true; // test read only exercises the link right now
+    }
+    return false;
   }
-  static size_t writeDecimal2(uint8_t *dst, uint8_t v) {
-    char tmp[3];
-    snprintf(tmp, sizeof(tmp), "%02u", v);
-    memcpy(dst, tmp, 2);
-    return 2;
-  }
-  static size_t writeHex4(uint8_t *dst, uint16_t v) {
+
+  static size_t writeHex4(char *dst, uint16_t v) {
     char tmp[5];
     snprintf(tmp, sizeof(tmp), "%04X", v);
     memcpy(dst, tmp, 4);
     return 4;
   }
-  static size_t writeHex2(uint8_t *dst, uint8_t v) {
+  static size_t writeDecimal2(char *dst, uint8_t v) {
     char tmp[3];
-    snprintf(tmp, sizeof(tmp), "%02X", v);
+    snprintf(tmp, sizeof(tmp), "%02u", v);
     memcpy(dst, tmp, 2);
     return 2;
   }
-  // PLACEHOLDER: best-effort 8-bit XOR checksum -- bench-verify against
-  // real PT traffic (see namespace-level comment above).
-  static uint8_t computeFcs(const uint8_t *buf, size_t n) {
-    uint8_t fcs = 0;
-    for (size_t i = 0; i < n; i++) fcs ^= buf[i];
-    return fcs;
+  // Zero-suppressed hex (e.g. 0 -> "0", 10 -> "A") -- matches the comma-
+  // separated, variable-width data encoding confirmed on the bench.
+  static size_t writeHexCompact(char *dst, uint16_t v) {
+    char tmp[5];
+    int len = snprintf(tmp, sizeof(tmp), "%X", v);
+    memcpy(dst, tmp, (size_t)len);
+    return (size_t)len;
   }
 };
 
@@ -592,11 +873,8 @@ void requestDisplayPush(const float *frame) {
 
 // State for the experimental 32x24 column-paced push: one column (of `rows`
 // words) is sent per COLUMN_WRITE_INTERVAL_MS tick from serviceMatrixPacing(),
-// instead of one 768-word burst. This is the actual "column-paced"
-// mitigation the spec describes -- the earlier draft of this file computed
-// the whole matrix but still sent it as a single WM burst, which reproduces
-// the exact failure mode (PT starved of time to service RM reads) this mode
-// exists to avoid.
+// instead of one 768-word burst -- the actual mitigation for the PT being
+// starved of time to service RM reads by one oversized write.
 struct PendingMatrixWrite {
   bool active = false;
   uint8_t cols = 0, rows = 0;
@@ -610,8 +888,7 @@ PendingMatrixWrite pendingMatrix;
 
 // Runtime-effective mode: starts at the compile-time default but can be
 // latched false by checkDisplayAutoFallback() below if the experimental
-// 32x24 mode is starving RM reads. Reading this (not the raw constant)
-// is what makes the fallback actually take effect.
+// 32x24 mode is starving RM reads.
 bool experimental32x24Effective = NS12::ENABLE_EXPERIMENTAL_32x24;
 
 void pushWordLampMatrix(const float *compositeFrame) {
@@ -695,9 +972,10 @@ void serviceMatrixPacing() {
 // Self-monitor for the experimental 32x24 column-paced mode: if RM read
 // success rate collapses under real traffic (as it did at 0/424 with the
 // old full-frame 32x24 push), fall back to the trusted 16x8 mode rather
-// than keep pushing into a PT that can't service reads. This is a runtime
-// safeguard standing in for the "close monitoring" the code audit called
-// for -- it has not been exercised against real hardware.
+// than keep pushing into a PT that can't service reads. Fed by the
+// periodic low-rate test read in NS12Manager::service() -- previously
+// nothing ever called into the RM path, so this safety net could never
+// have actually fired.
 void checkDisplayAutoFallback() {
   if (!experimental32x24Effective) return;
   if (ns12.rmAttemptCount() >= 50) {
@@ -827,6 +1105,8 @@ bool tubeKeyenceFired = false;
 int64_t tubeStartEncoderCount = 0;
 uint32_t lastMcpPollMs = 0;
 uint32_t lastMlxFrameMs = 0;
+uint32_t lastDiagnosticMs = 0;
+uint32_t heartbeatCounter = 0;
 
 const char *stateName(SystemState s) {
   switch (s) {
@@ -906,14 +1186,76 @@ void handleKeyenceResult() {
 }
 
 // =====================================================================
+// Telemetry helpers -- feed the NS12 $W0-$W8 block every loop (the manager
+// only actually transmits it every NS12::TELEMETRY_WRITE_INTERVAL_MS).
+// =====================================================================
+uint16_t toUnsignedX10(float value) {
+  if (!isfinite(value) || value <= 0.0f) return 0;
+  if (value >= 6553.5f) return 65535;
+  return (uint16_t)(value * 10.0f + 0.5f);
+}
+
+uint16_t buildStatusWord() {
+  uint16_t status = 0;
+  if (mlxDetected) status |= (1u << 0);
+  if (mlxInitialized) status |= (1u << 1);
+  if (lastFrameValid) status |= (1u << 2);
+  if (mcpOk) status |= (1u << 3);
+  if (state == SystemState::FaultStop) status |= (1u << 15);
+  return status;
+}
+
+// =====================================================================
+// Periodic Serial diagnostic report.
+// =====================================================================
+void printDiagnostics() {
+  Serial.println();
+  Serial.println(F("---- DIAGNOSTICS ----"));
+  Serial.printf("State              : %s\n", stateName(state));
+  Serial.printf("MCP initialized    : %s\n", mcpOk ? "YES" : "NO");
+  Serial.printf("Camera detected    : %s\n", mlxDetected ? "YES" : "NO");
+  Serial.printf("Camera initialized : %s\n", mlxInitialized ? "YES" : "NO");
+  Serial.printf("Last frame         : %s\n", lastFrameValid ? "OK" : "FAILED");
+  Serial.printf("Measured FPS       : %.2f\n", measuredFramesPerSecond);
+  Serial.printf("Min/Max/Avg temp C : %.1f / %.1f / %.1f\n",
+                minimumTemperatureC, maximumTemperatureC, averageTemperatureC);
+  Serial.printf("Good/Failed frames : %lu / %lu\n",
+                (unsigned long)successfulFrameCount, (unsigned long)failedFrameCount);
+
+  const char *captureStateStr = "?";
+  switch (capture.currentState()) {
+  case CaptureState::ARMED: captureStateStr = "ARMED"; break;
+  case CaptureState::SAMPLING: captureStateStr = "SAMPLING"; break;
+  case CaptureState::LATCHED: captureStateStr = "LATCHED"; break;
+  }
+  Serial.printf("Capture state      : %s\n", captureStateStr);
+  Serial.printf("Strip1 present/maxT/hotPx : %d / %.1f / %u\n",
+                capture.strip1().present, capture.strip1().maxTempC,
+                capture.strip1().hotPixelCount);
+  Serial.printf("Strip2 present/maxT/hotPx : %d / %.1f / %u\n",
+                capture.strip2().present, capture.strip2().maxTempC,
+                capture.strip2().hotPixelCount);
+
+  Serial.printf("NS12 WM attempts/failures : %lu / %lu\n",
+                (unsigned long)ns12.wmAttemptCount(), (unsigned long)ns12.wmFailureCount());
+  Serial.printf("NS12 RM attempts/success/writeFail/timeout/parseErr : %lu / %lu / %lu / %lu / %lu\n",
+                (unsigned long)ns12.rmAttemptCount(), (unsigned long)ns12.rmSuccessCount(),
+                (unsigned long)ns12.rmWriteFailureCount(), (unsigned long)ns12.rmTimeoutCount(),
+                (unsigned long)ns12.rmParseErrorCount());
+  Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
+  Serial.printf("Free heap          : %.1f kB\n", ESP.getFreeHeap() / 1024.0f);
+}
+
+// =====================================================================
 // Serial diagnostic commands:
 //   S/W/I/G/F  -- force state (bench test)
 //   1-6        -- toggle MCP outputs
 //   M          -- diagnostic test pattern / one-shot matrix push
-//   C          -- continuous bench stream / force capture
-//   B          -- baseline capture
-//   X          -- raw/corrected/calibrated dump
+//   C          -- force capture rearm
+//   B          -- baseline capture (placeholder, not yet characterized)
+//   X          -- calibrated frame dump
 //   R          -- rearm/clear latch
+//   D          -- print diagnostics immediately
 // =====================================================================
 void handleSerialCommand(char c) {
   switch (c) {
@@ -959,6 +1301,9 @@ void handleSerialCommand(char c) {
     capture.rearm();
     Serial.println(F("[DIAG] Rearmed."));
     break;
+  case 'D':
+    printDiagnostics();
+    break;
   default:
     break;
   }
@@ -969,11 +1314,24 @@ void handleSerialCommand(char c) {
 // =====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  const uint32_t serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart < 3000UL)) {
+    delay(10);
+  }
+
+  statusLed.begin();
+  statusLed.clear();
+  statusLed.show();
+  setStatusLed(0, 0, 20); // dim blue during startup
+
   Serial.printf("TGIS-510 %s (%s) booting...\n", FW_VERSION, FW_FILE);
 
   Wire.begin(Pins::I2C_SDA, Pins::I2C_SCL);
   Wire.setClock(I2C_CLOCK_HZ);
+  Wire.setTimeOut(1000);
+
+  printBoardInformation();
+  runI2CScanner();
 
   mcpOk = mcp.begin_I2C(MCP_I2C_ADDR, &Wire);
   Serial.printf("MCP initialized: %s\n", mcpOk ? "YES" : "NO");
@@ -988,11 +1346,11 @@ void setup() {
     }
   }
 
-  bool mlxOk = mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire);
+  mlxDetected = isI2CAddressPresent(MLX90640_I2CADDR_DEFAULT);
+  bool mlxOk = mlxDetected && initializeMlx();
+  mlxInitialized = mlxOk;
   Serial.printf("MLX90640 initialized: %s\n", mlxOk ? "YES" : "NO");
-  mlx.setMode(MLX90640_CHESS);
-  mlx.setResolution(MLX90640_ADC_18BIT);
-  mlx.setRefreshRate(MLX_REFRESH_RATE_NOMINAL);
+  setStatusLed(mlxOk ? 0 : 30, mlxOk ? 25 : 0, 0);
 
   ns12.begin();
 
@@ -1005,15 +1363,23 @@ void setup() {
   keyenceTrigger.begin(Pins::KEYENCE_TRIGGER_PIN);
   encoder.begin(Pins::ENCODER_PULSE_PIN);
 
+  fpsWindowStartMs = millis();
+  lastDiagnosticMs = millis();
+
   if (mcpOk && mlxOk) {
     state = SystemState::Standby;
     setMcpOutputs(false, false, false, false, true, false);
   } else {
     enterFaultStop();
   }
+
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true); // true = panic/reset on timeout
+  esp_task_wdt_add(NULL);
 }
 
 void loop() {
+  esp_task_wdt_reset();
+
   encoder.service();
   keyenceTrigger.service();
 
@@ -1046,14 +1412,59 @@ void loop() {
     }
   }
 
-  uint32_t nowMs = millis();
-  if (nowMs - lastMlxFrameMs >= MLX_FRAME_PERIOD_MS) {
-    lastMlxFrameMs = nowMs;
-    int status = mlx.getFrame(mlxFrame);
-    if (status == 0) {
-      capture.onNewFrame(mlxFrame);
+  if (mlxInitialized) {
+    uint32_t nowMs = millis();
+    if (nowMs - lastMlxFrameMs >= MLX_FRAME_PERIOD_MS) {
+      lastMlxFrameMs = nowMs;
+      int status = mlx.getFrame(mlxFrame);
+      lastFrameValid = (status == 0);
+
+      if (lastFrameValid) {
+        calculateFrameStatistics();
+        updateFrameRate();
+        capture.onNewFrame(mlxFrame);
+        successfulFrameCount++;
+        fpsWindowFrameCount++;
+        consecutiveFrameFailures = 0;
+        setStatusLed(0, 18, 0); // brief green heartbeat
+      } else {
+        failedFrameCount++;
+        consecutiveFrameFailures++;
+        setStatusLed(25, 8, 0);
+        if (consecutiveFrameFailures >= FRAME_FAILURE_RECOVERY_COUNT) {
+          attemptCameraRecovery();
+        }
+      }
+    }
+  } else {
+    // Retry camera detection every second without locking the CPU.
+    static uint32_t lastRetryMs = 0;
+    if (millis() - lastRetryMs >= 1000UL) {
+      lastRetryMs = millis();
+      mlxDetected = isI2CAddressPresent(MLX90640_I2CADDR_DEFAULT);
+      if (mlxDetected) {
+        mlxInitialized = initializeMlx();
+        if (mlxInitialized) {
+          consecutiveFrameFailures = 0;
+          fpsWindowStartMs = millis();
+          fpsWindowFrameCount = 0;
+          setStatusLed(0, 25, 0);
+          Serial.println(F("MLX90640 recovered and initialized."));
+        }
+      }
     }
   }
+
+  ns12.setTelemetry((uint16_t)(++heartbeatCounter),
+                     toUnsignedX10(measuredFramesPerSecond),
+                     toUnsignedX10(minimumTemperatureC),
+                     toUnsignedX10(maximumTemperatureC),
+                     toUnsignedX10(averageTemperatureC),
+                     (uint16_t)successfulFrameCount,
+                     (uint16_t)failedFrameCount,
+                     (uint16_t)state,
+                     buildStatusWord());
+  ns12.service();
 
   serviceDisplayThrottle();
   serviceMatrixPacing();
@@ -1066,5 +1477,10 @@ void loop() {
   if (state != lastLoggedState) {
     Serial.printf("[STATE] %s -> %s\n", stateName(lastLoggedState), stateName(state));
     lastLoggedState = state;
+  }
+
+  if (millis() - lastDiagnosticMs >= DIAGNOSTIC_INTERVAL_MS) {
+    lastDiagnosticMs = millis();
+    printDiagnostics();
   }
 }
