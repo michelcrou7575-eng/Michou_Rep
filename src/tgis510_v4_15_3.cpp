@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.2
+// Ref: TGIS-510_cpp_V4_15.3
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -90,6 +90,33 @@
 // guessing that part risks a silently checkerboard-corrupted image
 // rather than a compile error, so it isn't attempted here yet.
 //
+// FIELD UPDATE (V4.15.3): got the vendored library's actual source
+// (Adafruit_MLX90640.h/.cpp + utility/MLX90640_API.cpp). getRawFrame()
+// itself turned out to just call the private MLX90640_GetFrameData()
+// twice -- it does NOT resolve subpage-to-pixel mapping for the caller;
+// that lives inside the private MLX90640_CalculateTo(). Pulled the real
+// formula from that function rather than guessing:
+//   row = pixelNumber/32, col = pixelNumber%32
+//   chessPattern = (row%2) ^ (col%2)
+// A pixel's data is in whichever of the two raw reads has
+// frameData[833] (embedded subpage index) == that pixel's chessPattern
+// -- getRawFrame() doesn't guarantee frameData0 is always subpage 0, so
+// both reads are checked per pixel, not assumed. Verified against the
+// actual driver source, not assumed from general MLX90640 knowledge.
+//
+// The raw-ADC-delta path is now fully wired into the main acquisition
+// loop: readMlxRawCombined() (the verified combine above) + rawBaseline
+// (captured via 'B', averaging RAW_BASELINE_FRAME_COUNT idle frames) +
+// tempToPaletteIndex() against MATRIX_RAW_DELTA_MIN/MAX. mlx.getFrame()
+// is no longer called every frame -- only on demand by 'X', for a one-
+// off calibrated-C snapshot printed alongside the raw-delta dump, to
+// help correlate real thresholds. MATRIX_TEMP_MIN_C/MAX_C and
+// CAPTURE_TRIGGER_TEMP_C are unused by the live path now but kept for
+// reference. Not yet bench-verified: the two RAW_DELTA placeholder
+// values, and the chess-pattern combine logic above (correct by
+// inspection of the real driver source, but not yet cross-checked
+// against a real image on hardware).
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -121,10 +148,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.2"
+#define FW_VERSION_STRING "V4.15.3"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_2.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_3.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -238,6 +265,12 @@ static const float MLX_MEASURED_FPS = 8.0f;
 static const uint32_t MLX_FRAME_PERIOD_MS = (uint32_t)(1000.0f / MLX_MEASURED_FPS); // 125ms
 
 Adafruit_MLX90640 mlx;
+// Holds raw-ADC-delta values (see below) in the live acquisition path, NOT
+// calibrated degrees C -- kept as "mlxFrame" and the same 32x24 float
+// layout because CaptureController, downsampleMaxBlock(), and the rest of
+// the analysis pipeline were already written generically against "a float
+// per pixel compared to MIN/MAX constants" and don't care what physical
+// unit that float represents.
 float mlxFrame[32 * 24];
 
 bool mlxDetected = false;
@@ -248,6 +281,9 @@ uint32_t failedFrameCount = 0;
 uint8_t consecutiveFrameFailures = 0;
 constexpr uint8_t FRAME_FAILURE_RECOVERY_COUNT = 5;
 
+// Despite the "TemperatureC" names (kept to minimize churn against
+// telemetry/diagnostics call sites), these hold raw-ADC-delta statistics
+// as of V4.15.3, not degrees C -- see the raw-acquisition section below.
 float minimumTemperatureC = NAN;
 float maximumTemperatureC = NAN;
 float averageTemperatureC = NAN;
@@ -256,24 +292,117 @@ float measuredFramesPerSecond = 0.0f;
 uint32_t fpsWindowStartMs = 0;
 uint32_t fpsWindowFrameCount = 0;
 
-// Sanity ceiling/floor for a single MLX90640 pixel reading. Real hardware
-// (see field report: min 15.71C / avg 24.21C / max 782.23C on one frame)
-// shows a single glitching pixel can report values far beyond anything
-// physically plausible for this application -- unfiltered, that one pixel
-// becomes "maximum temp" and can force a false capture trigger, since
-// CAPTURE_TRIGGER_TEMP_C only needs one pixel to cross it. 300C is well
-// above the 180C production glue ceiling (margin for a genuinely hot
-// reading) and well below observed glitch values; -40C matches the
-// sensor's documented operating floor. This does not fix *why* the sensor
-// glitches (a MLX90640 bad-pixel table would be the real fix, out of scope
-// here) -- it only stops one glitch pixel from corrupting statistics, the
-// HMI display, and the QC capture trigger.
-constexpr float MIN_PLAUSIBLE_TEMP_C = -40.0f;
-constexpr float MAX_PLAUSIBLE_TEMP_C = 300.0f;
+// =====================================================================
+// Raw-ADC-delta acquisition (V4.15.3) -- replaces per-frame calibrated
+// getFrame() in the main loop. The HMI only ever shows 10 colors, so
+// running the MLX90640's full floating-point calibration on all 768
+// pixels every frame wasted CPU time for that output resolution; this
+// reads raw subpage data (getRawFrame(), this project's own addition to
+// Adafruit_MLX90640, NOT the standard API) and subtracts a once-captured
+// per-pixel idle baseline instead.
+//
+// Subpage-to-pixel combination verified against the actual driver source
+// (utility/MLX90640_API.cpp, MLX90640_CalculateTo()), not guessed:
+//   row = pixelNumber / 32, col = pixelNumber % 32
+//   chessPattern = (row % 2) ^ (col % 2)
+// A pixel's valid data lives in whichever of the two raw reads has
+// frameData[833] (the subpage index) equal to that pixel's chessPattern.
+// getRawFrame() does not guarantee frameData0 is always subpage 0 -- it
+// just returns "whichever subpage was next ready" twice -- so both reads
+// are checked per pixel rather than assumed.
+// =====================================================================
+uint16_t rawPage0[834];
+uint16_t rawPage1[834];
+
+// Per-pixel idle baseline (raw ADC counts, signed), captured once via the
+// 'B' serial command. Needed because each pixel has its own EEPROM offset/
+// gain trim -- real fixed-pattern noise, not sensor noise -- so raw counts
+// are only meaningful for threshold detection relative to a pixel's own
+// idle value, not compared directly against a single global threshold.
+float rawBaseline[32 * 24] = {0};
+bool rawBaselineCaptured = false;
+bool rawBaselineCaptureInProgress = false;
+uint8_t rawBaselineFramesCollected = 0;
+float rawBaselineAccumulator[32 * 24] = {0};
+constexpr uint8_t RAW_BASELINE_FRAME_COUNT = 32;
+
+// Combines one getRawFrame() result into a signed, per-pixel raw-ADC-count
+// array (NOT baseline-subtracted -- see subtractBaseline() below). Returns
+// false if getRawFrame() itself failed.
+bool readMlxRawCombined(float *outPixels) {
+  int status = mlx.getRawFrame(rawPage0, rawPage1);
+  if (status != 0) return false;
+
+  uint16_t subpageOf0 = rawPage0[833];
+  uint16_t subpageOf1 = rawPage1[833];
+
+  for (int pixelNumber = 0; pixelNumber < 32 * 24; pixelNumber++) {
+    int row = pixelNumber / 32;
+    int col = pixelNumber % 32;
+    int chessPattern = (row % 2) ^ (col % 2);
+
+    uint16_t raw;
+    if (chessPattern == subpageOf0) {
+      raw = rawPage0[pixelNumber];
+    } else if (chessPattern == subpageOf1) {
+      raw = rawPage1[pixelNumber];
+    } else {
+      // Neither read claims this pixel's subpage -- shouldn't happen if
+      // frameData0/1 are genuinely the two different subpages, but don't
+      // fabricate a value if it does.
+      outPixels[pixelNumber] = NAN;
+      continue;
+    }
+
+    // Raw ADC counts are signed via two's complement, same convention the
+    // driver's own MLX90640_CalculateTo() uses on frameData[pixelNumber].
+    int32_t signedRaw = (int32_t)raw;
+    if (signedRaw > 32767) signedRaw -= 65536;
+    outPixels[pixelNumber] = (float)signedRaw;
+  }
+  return true;
+}
+
+void subtractBaseline(const float *rawPixels, float *outDelta) {
+  for (int i = 0; i < 32 * 24; i++) {
+    outDelta[i] = rawPixels[i] - rawBaseline[i];
+  }
+}
+
+void startRawBaselineCapture() {
+  rawBaselineCaptureInProgress = true;
+  rawBaselineFramesCollected = 0;
+  for (int i = 0; i < 32 * 24; i++) rawBaselineAccumulator[i] = 0;
+  Serial.printf("[MLX] Baseline capture starting -- averaging %u idle frames.\n",
+                RAW_BASELINE_FRAME_COUNT);
+}
+
+// Call once per successful raw read while a baseline capture is running.
+void serviceRawBaselineCapture(const float *rawPixels) {
+  if (!rawBaselineCaptureInProgress) return;
+  for (int i = 0; i < 32 * 24; i++) rawBaselineAccumulator[i] += rawPixels[i];
+  rawBaselineFramesCollected++;
+  if (rawBaselineFramesCollected >= RAW_BASELINE_FRAME_COUNT) {
+    for (int i = 0; i < 32 * 24; i++) {
+      rawBaseline[i] = rawBaselineAccumulator[i] / (float)RAW_BASELINE_FRAME_COUNT;
+    }
+    rawBaselineCaptureInProgress = false;
+    rawBaselineCaptured = true;
+    Serial.println(F("[MLX] Baseline capture complete."));
+  }
+}
+
+// PLACEHOLDER, no physical grounding yet (see MATRIX_RAW_DELTA_MIN/MAX
+// below for why): sanity bound wide enough to allow real signal up to
+// several times CAPTURE_TRIGGER_RAW_DELTA with margin, while still
+// rejecting a wildly out-of-range single-pixel glitch. Needs the same
+// bench characterization as MATRIX_RAW_DELTA_MIN/MAX.
+constexpr float MIN_PLAUSIBLE_RAW_DELTA = -5000.0f;
+constexpr float MAX_PLAUSIBLE_RAW_DELTA = 5000.0f;
 uint16_t lastFrameRejectedPixelCount = 0;
 
 bool isPlausibleTemp(float t) {
-  return isfinite(t) && t >= MIN_PLAUSIBLE_TEMP_C && t <= MAX_PLAUSIBLE_TEMP_C;
+  return isfinite(t) && t >= MIN_PLAUSIBLE_RAW_DELTA && t <= MAX_PLAUSIBLE_RAW_DELTA;
 }
 
 void calculateFrameStatistics() {
@@ -356,13 +485,13 @@ void attemptCameraRecovery() {
   }
 }
 
-// PLACEHOLDER (Action Item 5): confirmed production range 20.0-180.0C.
+// SUPERSEDED as of V4.15.3 -- the live acquisition/palette/capture-trigger
+// path now runs on raw-ADC-delta units (MATRIX_RAW_DELTA_MIN/MAX,
+// CAPTURE_TRIGGER_RAW_DELTA below), not degrees C. Kept, unused by the
+// live path, only in case degree-accurate calibration is ever needed
+// again (e.g. an audit trail, or reverting to mlx.getFrame()).
 static const float MATRIX_TEMP_MIN_C = 20.0f;
 static const float MATRIX_TEMP_MAX_C = 180.0f;
-
-// PLACEHOLDER (Action Item 6): guess, needs real glue thermal-signature
-// data. Fallback idea if unreliable: frame-to-frame delta spike instead of
-// an absolute threshold.
 static const float CAPTURE_TRIGGER_TEMP_C = 30.0f;
 
 // PLACEHOLDER (Action Item 7): needs real 200 m/min validation. Tuning knob
@@ -370,40 +499,22 @@ static const float CAPTURE_TRIGGER_TEMP_C = 30.0f;
 static const uint8_t CAPTURE_SAMPLE_COUNT = 4;
 
 // =====================================================================
-// PLACEHOLDER (Action Item 8, added V4.15.2): raw-ADC-delta acquisition
-// path, not wired in yet.
+// Raw-ADC-delta thresholds (V4.15.3) -- these, not the Celsius constants
+// above, are what the live acquisition/palette/capture-trigger path
+// actually uses now. See the raw-acquisition section (readMlxRawCombined,
+// subtractBaseline, rawBaseline) above for how mlxFrame[] gets populated.
 //
-// The HMI only ever displays 10 discrete colors, so running the MLX90640's
-// full per-pixel floating-point calibration (temperature-dependent gain/
-// offset compensation, ambient/VDD correction -- the expensive part of
-// getFrame(), not the I2C read itself) on all 768 pixels every frame is
-// wasted CPU time for that output resolution. The intended replacement:
-// read raw subpage data (getRawFrame(), not part of the standard Adafruit
-// library API -- this project uses a fork/patch that adds it), subtract a
-// once-captured per-pixel idle baseline (same idea as the existing 'B'
-// baseline-capture command and rawBaseline0/rawBaseline1 below), and
-// linearly map that raw delta straight to a 0-9 palette index. No degrees
-// C anywhere in that path.
-//
-// NOT YET WIRED IN: doing this correctly also requires knowing exactly how
-// the two raw subpages combine into one 32x24 image for MLX90640_CHESS
-// mode (which pixel comes from which subpage) -- getting that wrong
-// produces a checkerboard-corrupted image, not a compile error, so it's
-// not being guessed at here. Needs the actual getRawFrame() signature from
-// this project's vendored lib/Adafruit_MLX90640/ before that part is
-// implemented.
-//
-// These two thresholds are placeholders in a much more literal sense than
-// MATRIX_TEMP_MIN_C/MAX_C above: a Celsius guess has real-world grounding
-// (hot melt glue is known to run in the 150-200C range); a raw ADC delta
-// has none -- it could plausibly be tens or thousands depending on gain
-// and resolution settings. These values are arbitrary compile-time stand-
-// ins only. To get real numbers: capture a baseline with 'B' at room
-// temp, then use 'X' against both an idle scene and a known-hot scene,
-// read the reported raw-minus-baseline deltas, and use those.
-static const int32_t MATRIX_RAW_DELTA_MIN = 0;    // PLACEHOLDER, no physical grounding
-static const int32_t MATRIX_RAW_DELTA_MAX = 1000; // PLACEHOLDER, no physical grounding
-static const int32_t CAPTURE_TRIGGER_RAW_DELTA = 300; // PLACEHOLDER, no physical grounding
+// These are placeholders in a more literal sense than MATRIX_TEMP_MIN_C/
+// MAX_C ever were: a Celsius guess has real-world grounding (hot melt
+// glue is known to run 150-200C); a raw ADC delta has none -- it could
+// plausibly be tens or thousands depending on gain and resolution
+// settings. These values are arbitrary compile-time stand-ins only. To
+// get real numbers: capture a baseline with 'B' at room temp, then use
+// 'X' against both an idle scene and a known-hot scene, read the
+// reported raw-minus-baseline deltas, and use those.
+static const float MATRIX_RAW_DELTA_MIN = 0.0f;      // PLACEHOLDER, no physical grounding
+static const float MATRIX_RAW_DELTA_MAX = 1000.0f;   // PLACEHOLDER, no physical grounding
+static const float CAPTURE_TRIGGER_RAW_DELTA = 300.0f; // PLACEHOLDER, no physical grounding
 
 // =====================================================================
 // Timing constraint (critical, unresolved):
@@ -1039,10 +1150,12 @@ private:
 NS12Manager ns12;
 
 // =====================================================================
-// Word Lamp temperature-to-palette mapping and matrix downsample.
+// Word Lamp raw-delta-to-palette mapping and matrix downsample. Despite
+// the name (kept to minimize churn at call sites), this maps a raw-ADC-
+// delta value (see MATRIX_RAW_DELTA_MIN/MAX above), not degrees C.
 // =====================================================================
-uint8_t tempToPaletteIndex(float tempC) {
-  float t = (tempC - MATRIX_TEMP_MIN_C) / (MATRIX_TEMP_MAX_C - MATRIX_TEMP_MIN_C);
+uint8_t tempToPaletteIndex(float rawDelta) {
+  float t = (rawDelta - MATRIX_RAW_DELTA_MIN) / (MATRIX_RAW_DELTA_MAX - MATRIX_RAW_DELTA_MIN);
   if (t < 0) t = 0;
   if (t > 1) t = 1;
   uint8_t idx = NS12::PALETTE_MIN_INDEX +
@@ -1223,7 +1336,7 @@ void checkDisplayAutoFallback() {
 
 // =====================================================================
 // Capture / QC composite -- max-hold per tube pass.
-// ARMED watches maximumTemperatureC against CAPTURE_TRIGGER_TEMP_C ->
+// ARMED watches the frame's raw-delta max against CAPTURE_TRIGGER_RAW_DELTA ->
 // SAMPLING accumulates CAPTURE_SAMPLE_COUNT frames -> LATCHED freezes the
 // HMI image until rearmed.
 //
@@ -1252,7 +1365,7 @@ public:
     switch (state) {
     case CaptureState::ARMED: {
       float maxT = frameMax(frame);
-      if (maxT >= CAPTURE_TRIGGER_TEMP_C) {
+      if (maxT >= CAPTURE_TRIGGER_RAW_DELTA) {
         // Seed with -INFINITY for implausible pixels rather than copying
         // them verbatim -- otherwise a single glitching pixel elsewhere in
         // the trigger frame (not even the one that crossed the threshold)
@@ -1301,9 +1414,9 @@ private:
   GlueStripResult strip1Result, strip2Result;
 
   // -INFINITY if no pixel in the frame is plausible -- always < any real
-  // CAPTURE_TRIGGER_TEMP_C, so a fully-glitched frame simply never triggers
-  // rather than triggering on frame[0] regardless of its validity (the
-  // previous version didn't check frame[0] at all).
+  // CAPTURE_TRIGGER_RAW_DELTA, so a fully-glitched frame simply never
+  // triggers rather than triggering on frame[0] regardless of its
+  // validity (the previous version didn't check frame[0] at all).
   static float frameMax(const float *frame) {
     float m = -INFINITY;
     for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
@@ -1324,7 +1437,7 @@ private:
         float v = compositeFrame[row * StripZone::COLS + c];
         if (!isPlausibleTemp(v)) continue; // unfilled cell (-INFINITY seed) or stray glitch
         if (v > r.maxTempC) r.maxTempC = v;
-        if (v >= CAPTURE_TRIGGER_TEMP_C) r.hotPixelCount++;
+        if (v >= CAPTURE_TRIGGER_RAW_DELTA) r.hotPixelCount++;
       }
     }
     r.present = r.hotPixelCount > 0;
@@ -1461,10 +1574,13 @@ void printDiagnostics() {
   Serial.printf("Camera initialized : %s\n", mlxInitialized ? "YES" : "NO");
   Serial.printf("Last frame         : %s\n", lastFrameValid ? "OK" : "FAILED");
   Serial.printf("Measured FPS       : %.2f\n", measuredFramesPerSecond);
-  Serial.printf("Min/Max/Avg temp C : %.1f / %.1f / %.1f\n",
+  Serial.printf("Raw baseline       : %s%s\n",
+                rawBaselineCaptured ? "CAPTURED" : "NOT CAPTURED (send 'B')",
+                rawBaselineCaptureInProgress ? " -- capturing now..." : "");
+  Serial.printf("Min/Max/Avg raw delta : %.0f / %.0f / %.0f\n",
                 minimumTemperatureC, maximumTemperatureC, averageTemperatureC);
-  Serial.printf("Implausible pixels : %u (outside %.0fC..%.0fC, rejected from stats/HMI/capture)\n",
-                lastFrameRejectedPixelCount, MIN_PLAUSIBLE_TEMP_C, MAX_PLAUSIBLE_TEMP_C);
+  Serial.printf("Implausible pixels : %u (outside %.0f..%.0f raw delta, rejected)\n",
+                lastFrameRejectedPixelCount, MIN_PLAUSIBLE_RAW_DELTA, MAX_PLAUSIBLE_RAW_DELTA);
   Serial.printf("Good/Failed frames : %lu / %lu\n",
                 (unsigned long)successfulFrameCount, (unsigned long)failedFrameCount);
 
@@ -1498,8 +1614,9 @@ void printDiagnostics() {
 //   1-6        -- toggle MCP outputs
 //   M          -- diagnostic test pattern / one-shot matrix push
 //   C          -- force capture rearm
-//   B          -- baseline capture (placeholder, not yet characterized)
-//   X          -- calibrated frame dump
+//   B          -- capture per-pixel raw baseline (needed before raw-delta
+//                 acquisition produces meaningful values -- run at idle)
+//   X          -- frame dump: raw-delta (live) vs one-off calibrated C
 //   R          -- rearm/clear latch
 //   D          -- print diagnostics immediately
 // =====================================================================
@@ -1520,8 +1637,8 @@ void handleSerialCommand(char c) {
   case 'M': {
     float testPattern[StripZone::COLS * StripZone::ROWS];
     for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
-      testPattern[i] = MATRIX_TEMP_MIN_C +
-                       (MATRIX_TEMP_MAX_C - MATRIX_TEMP_MIN_C) *
+      testPattern[i] = MATRIX_RAW_DELTA_MIN +
+                       (MATRIX_RAW_DELTA_MAX - MATRIX_RAW_DELTA_MIN) *
                            ((float)i / (StripZone::COLS * StripZone::ROWS));
     }
     pushWordLampMatrix(testPattern);
@@ -1533,12 +1650,29 @@ void handleSerialCommand(char c) {
     Serial.println(F("[DIAG] Capture forced/rearmed."));
     break;
   case 'B':
-    Serial.println(F("[DIAG] Baseline capture (not yet characterized -- placeholder)."));
+    if (!rawBaselineCaptureInProgress) {
+      startRawBaselineCapture();
+    } else {
+      Serial.println(F("[DIAG] Baseline capture already in progress."));
+    }
     break;
   case 'X': {
-    Serial.println(F("[DIAG] Frame dump (calibrated, from mlx.getFrame()):"));
+    Serial.println(F("[DIAG] Frame dump: raw-delta (live pipeline) vs calibrated C (one-off"));
+    Serial.println(F("       mlx.getFrame() snapshot, for correlating real thresholds):"));
+    if (!rawBaselineCaptured) {
+      Serial.println(F("[DIAG] WARNING: no baseline captured yet ('B') -- raw-delta values"));
+      Serial.println(F("       below are meaningless (baseline defaults to 0)."));
+    }
+    static float calibratedSnapshot[StripZone::COLS * StripZone::ROWS];
+    bool calibratedOk = mlxInitialized && (mlx.getFrame(calibratedSnapshot) == 0);
     for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
-      Serial.print(mlxFrame[i], 1);
+      Serial.print(mlxFrame[i], 0);
+      Serial.print('/');
+      if (calibratedOk) {
+        Serial.print(calibratedSnapshot[i], 1);
+      } else {
+        Serial.print(F("?"));
+      }
       Serial.print(i % StripZone::COLS == StripZone::COLS - 1 ? '\n' : ' ');
     }
     break;
@@ -1662,17 +1796,30 @@ void loop() {
     uint32_t nowMs = millis();
     if (nowMs - lastMlxFrameMs >= MLX_FRAME_PERIOD_MS) {
       lastMlxFrameMs = nowMs;
-      int status = mlx.getFrame(mlxFrame);
-      lastFrameValid = (status == 0);
+      // Raw read + baseline subtract (V4.15.3) replaces per-frame
+      // mlx.getFrame() here -- see the raw-acquisition section above.
+      static float rawPixelsNow[32 * 24];
+      bool rawOk = readMlxRawCombined(rawPixelsNow);
+      lastFrameValid = rawOk;
 
-      if (lastFrameValid) {
-        calculateFrameStatistics();
-        updateFrameRate();
-        capture.onNewFrame(mlxFrame);
+      if (rawOk) {
         successfulFrameCount++;
         fpsWindowFrameCount++;
         consecutiveFrameFailures = 0;
+        updateFrameRate();
         setStatusLed(0, 18, 0); // brief green heartbeat
+
+        if (rawBaselineCaptureInProgress) {
+          serviceRawBaselineCapture(rawPixelsNow);
+        } else if (rawBaselineCaptured) {
+          subtractBaseline(rawPixelsNow, mlxFrame);
+          calculateFrameStatistics();
+          capture.onNewFrame(mlxFrame);
+        }
+        // else: no baseline yet and none in progress -- raw reads succeed
+        // (fps/heartbeat/recovery logic all still work) but nothing feeds
+        // the QC/HMI pipeline until 'B' is run once. See the 'B'/'X'
+        // serial commands.
       } else {
         failedFrameCount++;
         consecutiveFrameFailures++;
