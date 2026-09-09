@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.0
+// Ref: TGIS-510_cpp_V4_15.1
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -49,6 +49,27 @@
 //      strip evaluation -- see calculateFrameStatistics(), downsampleMaxBlock(),
 //      and CaptureController below.
 //
+// FIELD UPDATE (V4.15.1, this file's own first run): confirmed the
+// isPlausibleTemp() fix above holds on real hardware (Implausible pixels: 0,
+// sane 20-50C range every report). The RM parse-failure dump then caught
+// this file's OWN reads failing too: raw response "ESC WM001F" every time,
+// identically -- shaped like our own WM-write signature ('W','M'), not an
+// RM reply ('R','M'), so the two-offset guess in parseRmResponse() was
+// never the actual bug. NS12Manager::service() now defers the telemetry
+// WM write (and serviceDisplayThrottle()/serviceMatrixPacing() defer their
+// matrix writes) while an RM read is pending, since RM_READ_TIMEOUT_MS and
+// TELEMETRY_WRITE_INTERVAL_MS are close enough (250-300ms) that a write
+// could otherwise land mid-read on this shared UART. If the same bogus
+// response still appears after this, it points at a genuine hardware
+// TX/RX loopback or PT echo rather than a timing overlap -- check wiring.
+//
+// Also fixed in V4.15.1, unrelated to NS12: a real boot showed
+// "Detected size(4096k) smaller than the size in the binary image
+// header(8192k)" and a fatal do_core_init assert on every startup --
+// platformio.ini's generic devkit board defaulted to 8MB flash against
+// this chip's real 4MB (ESP32-S3FH4R2 = Flash 4MB / PSRAM 2MB Quad).
+// Fixed in platformio.ini, not in this file.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -80,10 +101,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.0"
+#define FW_VERSION_STRING "V4.15.1"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_0.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_1.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
