@@ -32,6 +32,23 @@
 // tested. Re-verify the NS12 link (baud, ESC byte, frame framing) and the
 // Action-Item placeholder pins below before flashing to the real machine.
 //
+// FIELD UPDATE (2026-09): a real run of the archived reference file
+// (reference/HotMelt_MLX90640_80032_9_8_1.cpp, not this file) surfaced two
+// bugs this file inherited by porting that file's logic verbatim:
+//   1. RM reads: 0/2968 succeeded on real hardware -- the "confirmed
+//      working" claim for non-blocking RM reads was apparently never true
+//      for the response-parsing path specifically. parseRmResponse() now
+//      dumps the raw rejected bytes on every failure (unconditionally, not
+//      gated by a debug flag) so the real response framing can finally be
+//      read off directly instead of guessed at a third time.
+//   2. Maximum temp reported 782.23C against a 15.71-24.21C frame -- one
+//      glitching pixel, unfiltered, became "maximum temp" and would have
+//      force-triggered a false QC capture (CAPTURE_TRIGGER_TEMP_C=180C).
+//      isPlausibleTemp() (-40C..300C) now gates every pixel used for
+//      statistics, the HMI downsample, and the capture trigger/composite/
+//      strip evaluation -- see calculateFrameStatistics(), downsampleMaxBlock(),
+//      and CaptureController below.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -198,20 +215,44 @@ float measuredFramesPerSecond = 0.0f;
 uint32_t fpsWindowStartMs = 0;
 uint32_t fpsWindowFrameCount = 0;
 
+// Sanity ceiling/floor for a single MLX90640 pixel reading. Real hardware
+// (see field report: min 15.71C / avg 24.21C / max 782.23C on one frame)
+// shows a single glitching pixel can report values far beyond anything
+// physically plausible for this application -- unfiltered, that one pixel
+// becomes "maximum temp" and can force a false capture trigger, since
+// CAPTURE_TRIGGER_TEMP_C only needs one pixel to cross it. 300C is well
+// above the 180C production glue ceiling (margin for a genuinely hot
+// reading) and well below observed glitch values; -40C matches the
+// sensor's documented operating floor. This does not fix *why* the sensor
+// glitches (a MLX90640 bad-pixel table would be the real fix, out of scope
+// here) -- it only stops one glitch pixel from corrupting statistics, the
+// HMI display, and the QC capture trigger.
+constexpr float MIN_PLAUSIBLE_TEMP_C = -40.0f;
+constexpr float MAX_PLAUSIBLE_TEMP_C = 300.0f;
+uint16_t lastFrameRejectedPixelCount = 0;
+
+bool isPlausibleTemp(float t) {
+  return isfinite(t) && t >= MIN_PLAUSIBLE_TEMP_C && t <= MAX_PLAUSIBLE_TEMP_C;
+}
+
 void calculateFrameStatistics() {
   float sumC = 0.0f;
   float minC = INFINITY;
   float maxC = -INFINITY;
   uint16_t validCount = 0;
+  uint16_t rejectedCount = 0;
 
   for (size_t i = 0; i < 32 * 24; i++) {
     float t = mlxFrame[i];
-    if (!isfinite(t)) continue;
+    if (isfinite(t) && !isPlausibleTemp(t)) rejectedCount++;
+    if (!isPlausibleTemp(t)) continue;
     if (t < minC) minC = t;
     if (t > maxC) maxC = t;
     sumC += t;
     validCount++;
   }
+
+  lastFrameRejectedPixelCount = rejectedCount;
 
   if (validCount > 0) {
     minimumTemperatureC = minC;
@@ -491,7 +532,27 @@ void IRAM_ATTR keyenceResultIsr() {
 // address field by one byte) has not been independently pinned down either
 // -- parseRmResponse() below tries both candidate offsets and locks onto
 // whichever one validates against the address/count actually requested.
+//
+// FIELD REPORT (2026-09): on real hardware this offset-guessing approach
+// has NEVER actually worked -- 2968/2968 RM read attempts returned bytes
+// that parsed at neither offset (0 successes, 0 timeouts, all parse
+// errors), while WM writes appear to be going out fine. The archived
+// bench-tested file this was ported from claimed non-blocking RM reads as
+// "confirmed working," but that claim was evidently never true for the
+// response-parsing path specifically (only the ESC-byte-for-WM and 9600-
+// baud findings have independent corroborating evidence). Since neither
+// candidate offset has ever validated, parseRmResponse() below now dumps
+// the raw rejected line on every failure so the real framing can be read
+// off directly instead of guessed at again.
 // =====================================================================
+
+// Set to 1 for a full TX/RX byte trace on the Serial monitor (verbose --
+// every WM/RM byte). Off by default; flip on temporarily while chasing a
+// link problem. The RM parse-failure dump below is unconditional and
+// separate from this, since that specific failure needs visibility by
+// default, not just when this is enabled.
+#define NS12_DEBUG_RAW_RX 0
+
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
 constexpr long BAUD = 9600; // CONFIRMED bench value -- see header note above
@@ -590,6 +651,12 @@ public:
     }
     frame[n++] = '\r';
 
+#if NS12_DEBUG_RAW_RX
+    Serial.print(F("[NS12] TX WM: "));
+    for (size_t i = 0; i < n; i++) printRawByte((uint8_t)frame[i]);
+    Serial.println();
+#endif
+
     wmAttempts++;
     size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
     if (sent != n) {
@@ -620,6 +687,12 @@ public:
     n += writeHex4(&frame[n], startAddr);
     n += writeDecimal2(&frame[n], count);
     frame[n++] = '\r';
+
+#if NS12_DEBUG_RAW_RX
+    Serial.print(F("[NS12] TX RM: "));
+    for (size_t i = 0; i < n; i++) printRawByte((uint8_t)frame[i]);
+    Serial.println();
+#endif
 
     rmAttempts++;
     clearRxBuffer();
@@ -708,6 +781,42 @@ private:
     while (Serial2.available() > 0) Serial2.read();
   }
 
+  static void printRawByte(uint8_t value) {
+#if NS12_DEBUG_RAW_RX
+    if (value == NS12::ESC) { Serial.print(F("[ESC]")); return; }
+    if (value == '\r') { Serial.print(F("[CR]")); return; }
+    if (value >= 0x20 && value < 0x7F) { Serial.print((char)value); return; }
+    Serial.print('[');
+    if (value < 0x10) Serial.print('0');
+    Serial.print(value, HEX);
+    Serial.print(']');
+#else
+    (void)value;
+#endif
+  }
+
+  // Unconditional (not gated by NS12_DEBUG_RAW_RX) -- a parse failure is
+  // exactly the case that needs visibility by default. Cheap: only fires
+  // on the low-rate periodic test read, at most once per TEST_READ_INTERVAL_MS.
+  static void dumpRejectedLine(const char *line, size_t len) {
+    Serial.print(F("[NS12] RM parse failed, raw response ("));
+    Serial.print(len);
+    Serial.print(F(" bytes): "));
+    for (size_t i = 0; i < len; i++) {
+      printRawByteAlways((uint8_t)line[i]);
+    }
+    Serial.println();
+  }
+
+  static void printRawByteAlways(uint8_t value) {
+    if (value == NS12::ESC) { Serial.print(F("[ESC]")); return; }
+    if (value >= 0x20 && value < 0x7F) { Serial.print((char)value); return; }
+    Serial.print('[');
+    if (value < 0x10) Serial.print('0');
+    Serial.print(value, HEX);
+    Serial.print(']');
+  }
+
   // Non-blocking poll: consumes whatever bytes are currently available
   // without waiting. Completes the pending read only once a full line
   // (terminated by CR) has arrived, or aborts it on timeout/overflow.
@@ -728,6 +837,7 @@ private:
           rmSuccesses++;
         } else {
           rmParseErrors++;
+          dumpRejectedLine(readLineBuffer, readLineUsed);
         }
         readPending = false;
         return;
@@ -840,7 +950,9 @@ void downsampleMaxBlock(const float *src, uint8_t displayCols, uint8_t displayRo
           uint8_t sc = dc * blockW + x;
           uint8_t sr = dr * blockH + y;
           float v = src[sr * StripZone::COLS + sc];
-          if (v > m) m = v;
+          // Skip implausible pixels so one glitching pixel can't paint a
+          // false hot spot on the HMI (see isPlausibleTemp()).
+          if (isPlausibleTemp(v) && v > m) m = v;
         }
       }
       dst[dc * displayRows + dr] = m;
@@ -1022,7 +1134,13 @@ public:
     case CaptureState::ARMED: {
       float maxT = frameMax(frame);
       if (maxT >= CAPTURE_TRIGGER_TEMP_C) {
-        memcpy(compositeFrame, frame, sizeof(compositeFrame));
+        // Seed with -INFINITY for implausible pixels rather than copying
+        // them verbatim -- otherwise a single glitching pixel elsewhere in
+        // the trigger frame (not even the one that crossed the threshold)
+        // would ride along into the QC composite and strip evaluation.
+        for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
+          compositeFrame[i] = isPlausibleTemp(frame[i]) ? frame[i] : -INFINITY;
+        }
         sampleCount = 1;
         state = CaptureState::SAMPLING;
       }
@@ -1030,7 +1148,9 @@ public:
     }
     case CaptureState::SAMPLING: {
       for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
-        if (frame[i] > compositeFrame[i]) compositeFrame[i] = frame[i];
+        if (isPlausibleTemp(frame[i]) && frame[i] > compositeFrame[i]) {
+          compositeFrame[i] = frame[i];
+        }
       }
       sampleCount++;
       if (sampleCount >= CAPTURE_SAMPLE_COUNT) {
@@ -1061,10 +1181,14 @@ private:
   float compositeFrame[StripZone::COLS * StripZone::ROWS] = {0};
   GlueStripResult strip1Result, strip2Result;
 
+  // -INFINITY if no pixel in the frame is plausible -- always < any real
+  // CAPTURE_TRIGGER_TEMP_C, so a fully-glitched frame simply never triggers
+  // rather than triggering on frame[0] regardless of its validity (the
+  // previous version didn't check frame[0] at all).
   static float frameMax(const float *frame) {
-    float m = frame[0];
-    for (size_t i = 1; i < StripZone::COLS * StripZone::ROWS; i++) {
-      if (frame[i] > m) m = frame[i];
+    float m = -INFINITY;
+    for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
+      if (isPlausibleTemp(frame[i]) && frame[i] > m) m = frame[i];
     }
     return m;
   }
@@ -1079,6 +1203,7 @@ private:
     for (uint8_t c = colStart; c <= colEnd; c++) {
       for (uint8_t row = 0; row < StripZone::ROWS; row++) {
         float v = compositeFrame[row * StripZone::COLS + c];
+        if (!isPlausibleTemp(v)) continue; // unfilled cell (-INFINITY seed) or stray glitch
         if (v > r.maxTempC) r.maxTempC = v;
         if (v >= CAPTURE_TRIGGER_TEMP_C) r.hotPixelCount++;
       }
@@ -1219,6 +1344,8 @@ void printDiagnostics() {
   Serial.printf("Measured FPS       : %.2f\n", measuredFramesPerSecond);
   Serial.printf("Min/Max/Avg temp C : %.1f / %.1f / %.1f\n",
                 minimumTemperatureC, maximumTemperatureC, averageTemperatureC);
+  Serial.printf("Implausible pixels : %u (outside %.0fC..%.0fC, rejected from stats/HMI/capture)\n",
+                lastFrameRejectedPixelCount, MIN_PLAUSIBLE_TEMP_C, MAX_PLAUSIBLE_TEMP_C);
   Serial.printf("Good/Failed frames : %lu / %lu\n",
                 (unsigned long)successfulFrameCount, (unsigned long)failedFrameCount);
 
