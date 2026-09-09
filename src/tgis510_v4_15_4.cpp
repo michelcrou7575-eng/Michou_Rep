@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.3
+// Ref: TGIS-510_cpp_V4_15.4
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -117,6 +117,18 @@
 // inspection of the real driver source, but not yet cross-checked
 // against a real image on hardware).
 //
+// FIELD UPDATE (V4.15.4): with the previous update's write/read overlap
+// fix in place, RM went from 100% parse failures ("WM001F" bleeding in
+// from writes) to 117/117 clean timeouts -- zero responses, not
+// malformed ones. Conclusion: this PT does not answer RM requests in
+// this configuration at all; it was never a framing or timing bug.
+// Since RM isn't load-bearing for the live 16x8 path (only the
+// currently-off experimental 32x24 auto-fallback needs it), and every
+// attempt now guarantees paying its full 250ms timeout (during which
+// telemetry/matrix writes are deferred) for zero benefit, the periodic
+// RM test read is now disabled by default -- see
+// NS12_ENABLE_RM_TEST_READ in the NS12 namespace.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -148,10 +160,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.3"
+#define FW_VERSION_STRING "V4.15.4"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_3.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_4.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -797,6 +809,20 @@ constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 // those stats never move and the fallback can never trigger. Mirrors the
 // bench-tested file's $W10 "operator test input" convention; repoint if
 // the CX-Designer project already uses $W10 for something else.
+//
+// DISABLED BY DEFAULT (field report, V4.15.3 run): once the WM-write-vs-
+// pending-read overlap was eliminated (see NS12Manager::service()'s
+// !readPending gating), RM went from 100% parse failures to 117/117
+// clean timeouts -- zero responses, not malformed ones. This PT does not
+// appear to answer RM requests in this configuration at all. RM isn't
+// load-bearing for the live 16x8 path (only the currently-OFF
+// experimental 32x24 mode's auto-fallback depends on it), so polling for
+// a read that always times out was pure cost: every attempt guarantees a
+// 250ms wait during which telemetry/matrix WM writes are deferred, for a
+// safety net that never actually monitors anything live right now. Set
+// to 1 to re-enable -- required again if ENABLE_EXPERIMENTAL_32x24 is
+// ever turned on, since its auto-fallback has no data without this.
+#define NS12_ENABLE_RM_TEST_READ 0
 constexpr uint16_t TEST_READ_ADDR = 10;
 constexpr uint32_t TEST_READ_INTERVAL_MS = 300;
 
@@ -917,29 +943,33 @@ public:
   }
 
   // Must be called every loop() iteration. Drives the periodic telemetry
-  // push, the periodic low-rate test read, and the non-blocking read
-  // state machine. Never blocks.
+  // push, the periodic low-rate test read (if NS12_ENABLE_RM_TEST_READ),
+  // and the non-blocking read state machine. Never blocks.
   void service() {
     uint32_t now = millis();
 
-    // Deliberately gated on !readPending: RM_READ_TIMEOUT_MS and
+    // Gated on !readPending: RM_READ_TIMEOUT_MS and
     // TELEMETRY_WRITE_INTERVAL_MS are both 250-300ms, so a telemetry WM
     // write could otherwise fire in the middle of an in-flight RM read on
     // this shared half-visible UART. pollPendingRead() only checks that a
     // byte stream starts at an ESC, not where it actually came from -- see
     // the field-report comment on the NS12 namespace for why that matters
-    // (every captured "RM response" so far has actually had a WM-shaped
-    // header). This delays telemetry by at most one RM_READ_TIMEOUT_MS
-    // window, not lost -- it fires on the next service() call instead.
+    // (every captured "RM response" so far had a WM-shaped header, before
+    // this gating existed). This delays telemetry by at most one
+    // RM_READ_TIMEOUT_MS window, not lost. Harmless no-op with RM test
+    // reads disabled (readPending then never becomes true), left in place
+    // so re-enabling NS12_ENABLE_RM_TEST_READ doesn't need this back too.
     if (!readPending && now - lastTelemetryMs >= NS12::TELEMETRY_WRITE_INTERVAL_MS) {
       lastTelemetryMs = now;
       sendWM(NS12::TELEMETRY_BASE_ADDR, telemetry, NS12::TELEMETRY_WORD_COUNT);
     }
 
+#if NS12_ENABLE_RM_TEST_READ
     if (!readPending && (now - lastTestReadMs >= NS12::TEST_READ_INTERVAL_MS)) {
       lastTestReadMs = now;
       requestRM(NS12::TEST_READ_ADDR, 1);
     }
+#endif
 
     if (readPending) {
       pollPendingRead(now);
@@ -1600,10 +1630,14 @@ void printDiagnostics() {
 
   Serial.printf("NS12 WM attempts/failures : %lu / %lu\n",
                 (unsigned long)ns12.wmAttemptCount(), (unsigned long)ns12.wmFailureCount());
+#if NS12_ENABLE_RM_TEST_READ
   Serial.printf("NS12 RM attempts/success/writeFail/timeout/parseErr : %lu / %lu / %lu / %lu / %lu\n",
                 (unsigned long)ns12.rmAttemptCount(), (unsigned long)ns12.rmSuccessCount(),
                 (unsigned long)ns12.rmWriteFailureCount(), (unsigned long)ns12.rmTimeoutCount(),
                 (unsigned long)ns12.rmParseErrorCount());
+#else
+  Serial.println(F("NS12 RM test read  : disabled (PT doesn't respond -- see NS12 namespace comment)"));
+#endif
   Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
   Serial.printf("Free heap          : %.1f kB\n", ESP.getFreeHeap() / 1024.0f);
 }
