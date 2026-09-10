@@ -34,8 +34,6 @@ the handoff were available to produce this. Before flashing:
 | Keyence IV2-G300CA + IV2-G30 | Vision sensor — owns glue trace start/end detection |
 | ZATOR LMZ02 encoder | Tube position/length tracking |
 
-Division of responsibility, and why, is documented at the top of
-`src/tgis510_v4_14_0.cpp`.
 
 ## Build
 
@@ -52,26 +50,19 @@ pio device monitor
 ## What this implementation does, following the handoff exactly
 
 - I2C at 800kHz (not 1MHz — that silently broke MCP23017 enumeration).
-- MLX90640 timing driven off the **measured** 8 FPS, not the nominal 32Hz
-  refresh setting.
-- `MATRIX_TEMP_MIN_C`/`MAX_C` set to the production range (20–180°C), not
-  the 20–40°C bench value.
+- `MATRIX_TEMP_MIN_C`/`MAX_C` set to the production range (20–180°C).
 - NS12 Memory Link: ESC=0x1B for every command (this PT's confirmed
-  deviation from the Omron manual's 0x1C), 38400 baud, non-blocking WM
+  deviation from the Omron manual's 0x1C), 38400 (9600 for now) baud, non-blocking WM
   writes, blocking-flush RM reads with a 250ms timeout, byte-resyncing
   `pollRead()`.
 - Word Lamp palette clamped to indices 1–9 (index 0 is blank/off).
-- 16×8 Word Lamp matrix (`$W700`–`$W827`) as the trusted default; the
+- 16×8 Word Lamp matrix (`$W700`–`$W827`) as the default; the
   32×24 mode is implemented as a genuinely **column-paced** push (one
   column/WM command, spaced by `COLUMN_WRITE_INTERVAL_MS`) behind
   `NS12::ENABLE_EXPERIMENTAL_32x24` (default off), with a runtime
   auto-fallback to 16×8 if RM read success rate collapses under load.
 - Capture/QC state machine is max-hold (ARMED → SAMPLING → LATCHED), not
   averaging, per the FOV-transit reasoning in the handoff.
-- Keyence result arrives on a **direct ESP32 GPIO with a hardware
-  interrupt**, not through MCP23017 polling (MCP is only polled in
-  Standby/TubeGap, ~20ms cadence — too slow for a signal that must be
-  actionable during InspectingTube).
 - Keyence trigger pulse is a non-blocking, `micros()`-timed pending-low
   state, not a blocking `digitalWrite` sequence.
 - Encoder uses the ESP32 PCNT peripheral, drained into a 64-bit running
@@ -82,24 +73,23 @@ pio device monitor
 
 ## Open placeholders (unresolved, from the handoff — need real hardware)
 
-These are marked `PLACEHOLDER` at their definition in
-`src/tgis510_v4_14_0.cpp`:
-
 1. **GPIO assignments** — `ENCODER_PULSE_PIN`, `PRESENCE_SENSOR_PIN`,
-   `KEYENCE_TRIGGER_PIN`, and the newly-added `KEYENCE_RESULT_PIN` are not
+   `KEYENCE_TRIGGER_PIN` are not
    bench-verified against the physical board silkscreen.
 2. `ENCODER_COUNTS_PER_MM` — blocked on confirming the ZATOR LMZ02 encoder
    PPR.
-3. `PRESENCE_TO_MLX_DISTANCE_MM`, `PRESENCE_TO_KEYENCE_DISTANCE_MM`.
-4. Keyence result pulse polarity (`KEYENCE_RESULT_ACTIVE_LEVEL`).
-5. Confirm `MATRIX_TEMP_MAX_C` (180.0°C) is correct before running against
+3. `PRESENCE_TO_MLX_DISTANCE_MM`, `PRESENCE_TO_KEYENCE_DISTANCE_A_MM` (HotMelt Start Position),
+   `PRESENCE_TO_KEYENCE_DISTANCE_B_MM` (HotMelt End Position).
+4. Both HotMelt Start/End Position , reference on the Start & End Edges are inputed On HMI
+5. So , After the 1st tube, the tube width should be deduced [mm] to output KEYENCE_TRIGGER_PIN Out.
+6. Confirm `MATRIX_TEMP_MAX_C` (180.0°C) is correct before running against
    real hot melt.
-6. `CAPTURE_TRIGGER_TEMP_C` (30.0°C) — a guess; consider a frame-to-frame
+7. `CAPTURE_TRIGGER_TEMP_C` (30.0°C) — a guess; consider a frame-to-frame
    delta spike instead of an absolute threshold if unreliable.
-7. `CAPTURE_SAMPLE_COUNT` (4 frames) and the glue-strip column ranges in
+8. `CAPTURE_SAMPLE_COUNT` (4 frames) and the glue-strip column ranges in
    `StripZone` — none of this has been validated at real line speed
    (200 m/min assumption) or against a real tube.
-8. The NS12 Memory Link FCS checksum (`computeFcs`, 8-bit XOR) is a
+9. The NS12 Memory Link FCS checksum (`computeFcs`, 8-bit XOR) is a
    best-effort guess — this PT already has one undocumented protocol
    deviation (the ESC byte), so treat the checksum as unverified until
    confirmed against real WM/RM traffic.
