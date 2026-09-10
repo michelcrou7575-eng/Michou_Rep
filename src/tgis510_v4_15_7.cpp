@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.6
+// Ref: TGIS-510_cpp_V4_15.7
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -165,6 +165,19 @@
 // more, so a regression here is visible in diagnostics instead of
 // silently corrupting the frame again.
 //
+// FIELD UPDATE (V4.15.7): confirmed none of ENCODER_PULSE_PIN,
+// PRESENCE_SENSOR_PIN, KEYENCE_TRIGGER_PIN, KEYENCE_RESULT_PIN are
+// physically wired yet (Action Item 1 still open). The two CHANGE-
+// interrupt inputs (presence sensor, Keyence result) were configured as
+// bare INPUT -- floating, since nothing's connected -- which invites
+// noise-triggered spurious interrupts driving handlePresenceEdge()/
+// handleKeyenceResult() off phantom edges instead of a real sensor,
+// corrupting bench testing of every other subsystem in the meantime.
+// Changed both (and the encoder pulse pin, same reasoning, lower
+// operational impact) to INPUT_PULLDOWN for a defined idle state.
+// Assumed polarity, not confirmed -- revisit once real sensor output
+// types are known, per Action Item 1.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -196,10 +209,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.6"
+#define FW_VERSION_STRING "V4.15.7"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_6.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_7.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -625,6 +638,15 @@ bool mcpOk = false;
 class EncoderTracker {
 public:
   void begin(uint8_t pulseGpio) {
+    // PULLDOWN: same reasoning as PRESENCE_SENSOR_PIN/KEYENCE_RESULT_PIN
+    // below -- the encoder isn't physically wired yet (field report), and
+    // pcnt_unit_config() doesn't set a pull resistor on its own, so a
+    // floating pulse line would register phantom counts from noise. The
+    // 100ns glitch filter below only rejects very short noise, not
+    // sustained floating-pin toggling. Low operational impact either way
+    // (encoder.total() is re-zeroed via tubeStartEncoderCount at the start
+    // of every real tube cycle) but cheap to make consistent.
+    pinMode(pulseGpio, INPUT_PULLDOWN);
     pcnt_config_t cfg = {};
     cfg.pulse_gpio_num = pulseGpio;
     cfg.ctrl_gpio_num = PCNT_PIN_NOT_USED;
@@ -1830,10 +1852,22 @@ void setup() {
 
   ns12.begin();
 
-  pinMode(Pins::PRESENCE_SENSOR_PIN, INPUT);
+  // PULLDOWN, not bare INPUT (field report: neither sensor is physically
+  // wired yet). A floating input on a CHANGE-interrupt pin picks up noise
+  // and fires spuriously, driving handlePresenceEdge()/handleKeyenceResult()
+  // off phantom edges instead of a real sensor -- corrupting bench testing
+  // of every other subsystem in the meantime. PULLDOWN gives both pins a
+  // defined idle LOW, consistent with the code's existing assumptions
+  // (presenceState reads HIGH-active per handlePresenceEdge()'s rising-edge
+  // = "tube entering"; KEYENCE_RESULT_ACTIVE_LEVEL is already HIGH).
+  // PLACEHOLDER like the pins themselves (Action Item 1): revisit once the
+  // real sensors' output types (NPN/PNP/push-pull) are known -- this may
+  // need to become INPUT_PULLUP or no internal pull at all depending on
+  // actual wiring.
+  pinMode(Pins::PRESENCE_SENSOR_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(Pins::PRESENCE_SENSOR_PIN), presenceIsr, CHANGE);
 
-  pinMode(Pins::KEYENCE_RESULT_PIN, INPUT);
+  pinMode(Pins::KEYENCE_RESULT_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(Pins::KEYENCE_RESULT_PIN), keyenceResultIsr, CHANGE);
 
   keyenceTrigger.begin(Pins::KEYENCE_TRIGGER_PIN);
