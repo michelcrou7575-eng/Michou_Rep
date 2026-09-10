@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.5
+// Ref: TGIS-510_cpp_V4_15.6
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -145,6 +145,26 @@
 // use until a recapture completes -- but confusing) and is now one
 // unambiguous message instead of two concatenated ones.
 //
+// FIELD UPDATE (V4.15.6): root-caused "'M' shows nothing on the PT" from
+// the actual captured wire bytes ("WM002BC121,2,3,...") rather than
+// guessing again at capture-state gating. Address 02BC(=700) decoded
+// correctly, but the count field read "12" while 128 comma-separated
+// values followed -- the NS12 wire protocol's LL field is exactly 2
+// decimal digits (*L(2 dec)), so the default 16x8 mode's one-shot
+// 128-word burst was never a legal frame in the first place, and
+// writeDecimal2()'s 2-byte tmp buffer silently truncated "128" to "12"
+// instead of erroring. The PT was told to expect 12 words while 128
+// followed and never rendered anything -- explains every prior "screen
+// shows nothing" report for the default (non-experimental) matrix mode.
+// Fixed at the architecture level: pushWordLampMatrix() now always
+// column-paces (rows=8 or 24 words per WM command, both well under the
+// 99-word protocol ceiling), for both 16x8 and 32x24, never a single
+// cols*rows burst. MAX_WM_WORDS corrected from 128 (wrong -- that was
+// the bug, not a real limit) to 99 (the actual protocol ceiling), with a
+// defensive clamp + counted wmOversizedCount if anything ever requests
+// more, so a regression here is visible in diagnostics instead of
+// silently corrupting the frame again.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -176,10 +196,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.5"
+#define FW_VERSION_STRING "V4.15.6"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_5.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_6.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -842,9 +862,15 @@ constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 constexpr uint16_t TEST_READ_ADDR = 10;
 constexpr uint32_t TEST_READ_INTERVAL_MS = 300;
 
-// Largest single WM burst used anywhere (the 16x8 default matrix: 128
-// words). Also sizes the sendWM() stack buffer.
-constexpr uint16_t MAX_WM_WORDS = 128;
+// Hard protocol ceiling, not a tuning knob: the WM/RM wire format's LL
+// field is exactly 2 decimal digits (*L(2 dec) in the protocol reference),
+// so no single WM command can legitimately carry more than 99 words --
+// sending more doesn't fail loudly, it silently desyncs the frame (see the
+// V4.15.6 field-report comment on the NS12 namespace for exactly how that
+// broke the default 16x8 matrix push). Also sizes the sendWM() stack
+// buffer; the largest real chunk today is 24 words (experimental 32x24
+// columns), so 99 leaves comfortable margin without being the bug again.
+constexpr uint16_t MAX_WM_WORDS = 99;
 
 // Spacing between successive column writes in the experimental 32x24 mode.
 //
@@ -877,11 +903,16 @@ public:
     lastTestReadMs = millis();
   }
 
-  // WM: write `count` words starting at `startAddr`. `count` is clamped to
-  // NS12::MAX_WM_WORDS -- callers must stay within that (the 16x8 burst,
-  // telemetry block, and single-column experimental writes all do).
+  // WM: write `count` words starting at `startAddr`. count > 99 is a
+  // protocol violation (the wire LL field is exactly 2 decimal digits),
+  // not a soft limit -- clamped defensively and counted as a failure so a
+  // future regression is visible in diagnostics instead of silently
+  // desyncing the frame the way the pre-V4.15.6 count-field truncation did.
   void sendWM(uint16_t startAddr, const uint16_t *data, uint16_t count) {
-    if (count > NS12::MAX_WM_WORDS) count = NS12::MAX_WM_WORDS;
+    if (count > NS12::MAX_WM_WORDS) {
+      count = NS12::MAX_WM_WORDS;
+      wmOversizedCount++;
+    }
     char frame[4 + 4 + 2 + NS12::MAX_WM_WORDS * 5 + 1];
     size_t n = 0;
     frame[n++] = (char)NS12::ESC;
@@ -1013,6 +1044,7 @@ public:
   uint32_t rmParseErrorCount() const { return rmParseErrors; }
   uint32_t wmAttemptCount() const { return wmAttempts; }
   uint32_t wmFailureCount() const { return wmFailures; }
+  uint32_t wmOversizedCountValue() const { return wmOversizedCount; }
   void resetRmStats() { rmAttempts = 0; rmSuccesses = 0; }
 
   // Exposed so the matrix-push free functions (serviceDisplayThrottle(),
@@ -1040,6 +1072,7 @@ private:
   uint32_t rmParseErrors = 0;
   uint32_t wmAttempts = 0;
   uint32_t wmFailures = 0;
+  uint32_t wmOversizedCount = 0;
 
   void clearRxBuffer() {
     while (Serial2.available() > 0) Serial2.read();
@@ -1306,25 +1339,29 @@ void pushWordLampMatrix(const float *compositeFrame) {
   }
   uint16_t band01[2] = {(uint16_t)(bandMax[0] * 10), (uint16_t)(bandMax[1] * 10)};
 
-  if (cols == NS12::MATRIX_COLS_DEFAULT && rows == NS12::MATRIX_ROWS_DEFAULT) {
-    // Trusted 16x8 layout: one 128-word burst, exactly as documented.
-    ns12.sendWM(NS12::MATRIX_BASE_ADDR, words, cols * rows);
-    ns12.sendWM(828, band01, 2);
-  } else {
-    // Experimental 32x24: hand off to the column-paced dispatcher. Band-max
-    // words go immediately after the matrix block so they never collide
-    // with it, unlike the fixed 828/829 addresses the 32x24 block would
-    // otherwise overrun.
-    memcpy(pendingMatrix.words, words, sizeof(uint16_t) * cols * rows);
-    pendingMatrix.cols = cols;
-    pendingMatrix.rows = rows;
-    pendingMatrix.bandAddr = NS12::MATRIX_BASE_ADDR + cols * rows;
-    pendingMatrix.band01[0] = band01[0];
-    pendingMatrix.band01[1] = band01[1];
-    pendingMatrix.nextCol = 0;
-    pendingMatrix.lastWriteMs = 0; // fire the first column on the next service() tick
-    pendingMatrix.active = true;
-  }
+  // Always column-paced, including the default 16x8 mode -- NEVER a single
+  // cols*rows-word burst. Root cause (field report): the NS12 wire protocol's
+  // LL field is exactly 2 decimal digits (*L(2 dec) in the protocol
+  // reference), so no single WM command can legitimately carry more than 99
+  // words. The old "one 128-word burst for 16x8" path violated that, and
+  // writeDecimal2()'s 2-byte tmp buffer silently truncated the count field
+  // from "128" to "12" rather than erroring -- so the PT was being told to
+  // expect 12 words while 128 followed, and (per the real captured bytes:
+  // "WM002BC121,2,3,...") never rendered anything. Splitting into column
+  // writes (rows=8 or 24 words each, both well under 99) fixes this at the
+  // architecture level rather than patching the symptom. For 16x8 this
+  // lands the band-max words at the same $828/$829 the old direct path
+  // used (MATRIX_BASE_ADDR + cols*rows = 700+128 = 828), so no HMI-side
+  // address change.
+  memcpy(pendingMatrix.words, words, sizeof(uint16_t) * cols * rows);
+  pendingMatrix.cols = cols;
+  pendingMatrix.rows = rows;
+  pendingMatrix.bandAddr = NS12::MATRIX_BASE_ADDR + cols * rows;
+  pendingMatrix.band01[0] = band01[0];
+  pendingMatrix.band01[1] = band01[1];
+  pendingMatrix.nextCol = 0;
+  pendingMatrix.lastWriteMs = 0; // fire the first column on the next service() tick
+  pendingMatrix.active = true;
 }
 
 // Called every loop() iteration; flushes a queued composite once the
@@ -1340,7 +1377,10 @@ void serviceDisplayThrottle() {
   pushWordLampMatrix(pendingDisplayFrame);
 }
 
-// Called every loop() iteration; no-op unless a paced 32x24 push is active.
+// Called every loop() iteration; no-op unless a paced matrix push is
+// active. Handles both the default 16x8 mode and experimental 32x24 --
+// pendingMatrix.cols/rows are set per-push in pushWordLampMatrix(), never
+// hardcoded here.
 void serviceMatrixPacing() {
   if (!pendingMatrix.active) return;
   if (ns12.isReadPending()) return; // defer -- see field-report comment on NS12 namespace
@@ -1649,8 +1689,9 @@ void printDiagnostics() {
                 capture.strip2().present, capture.strip2().maxTempC,
                 capture.strip2().hotPixelCount);
 
-  Serial.printf("NS12 WM attempts/failures : %lu / %lu\n",
-                (unsigned long)ns12.wmAttemptCount(), (unsigned long)ns12.wmFailureCount());
+  Serial.printf("NS12 WM attempts/failures/oversized : %lu / %lu / %lu\n",
+                (unsigned long)ns12.wmAttemptCount(), (unsigned long)ns12.wmFailureCount(),
+                (unsigned long)ns12.wmOversizedCountValue());
 #if NS12_ENABLE_RM_TEST_READ
   Serial.printf("NS12 RM attempts/success/writeFail/timeout/parseErr : %lu / %lu / %lu / %lu / %lu\n",
                 (unsigned long)ns12.rmAttemptCount(), (unsigned long)ns12.rmSuccessCount(),
