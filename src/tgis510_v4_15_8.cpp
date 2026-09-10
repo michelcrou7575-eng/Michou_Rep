@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.7
+// Ref: TGIS-510_cpp_V4_15.8
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -178,6 +178,27 @@
 // Assumed polarity, not confirmed -- revisit once real sensor output
 // types are known, per Action Item 1.
 //
+// FIELD UPDATE (V4.15.8): replaced the single fixed
+// PRESENCE_TO_KEYENCE_DISTANCE_MM with operator-entered HotMelt Start/End
+// Position (hotMeltStartPositionMm/hotMeltEndPositionMm), per spec: Start
+// is referenced from the tube's leading edge (known immediately), End
+// from the trailing edge (only knowable once a tube's length has been
+// measured -- so the first tube after a gap gets no End-position check;
+// every tube after that uses the previous tube's measured length). Real
+// values are meant to come from the HMI via RM (serviceHmiInputPolling(),
+// NS12_ENABLE_RM_POLLING) -- currently OFF by default since RM still gets
+// zero response from this PT; both positions sit on PLACEHOLDER fallback
+// constants until that's resolved. Top suspect for the RM non-response,
+// not yet tried: CX-Designer's Memory Link "Response" setting, documented
+// OFF in this project's original setup notes -- if that gates ALL PT-
+// initiated replies (not just WM-write acknowledgment), it would exactly
+// explain WM succeeding at 100% while RM times out at 100%. Try flipping
+// it ON and re-downloading the PT project before assuming RM is
+// unfixable. Also unconfirmed: the two HOTMELT_*_POSITION_ADDR $W
+// addresses (placeholders, never checked against the real CX-Designer
+// project) and the HMI numeric input's count-to-mm scale
+// (HMI_POSITION_MM_PER_COUNT, assumed 1:1).
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -209,10 +230,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.7"
+#define FW_VERSION_STRING "V4.15.8"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_7.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_8.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -692,10 +713,50 @@ EncoderTracker encoder;
 // PPR against real hardware.
 static float ENCODER_COUNTS_PER_MM = 1.0f;
 
-// PLACEHOLDER (Action Item 3): distances from the presence sensor to each
-// downstream station, used for forward projection.
+// PLACEHOLDER (Action Item 3): distance from the presence sensor to the
+// MLX90640 station, used for forward projection.
 static float PRESENCE_TO_MLX_DISTANCE_MM = 100.0f;
-static float PRESENCE_TO_KEYENCE_DISTANCE_MM = 150.0f;
+
+// =====================================================================
+// HotMelt Start/End Position (V4.15.8) -- replaces the old single fixed
+// PRESENCE_TO_KEYENCE_DISTANCE_MM with two operator-entered positions:
+//   - Start Position: distance from the tube's LEADING edge to where the
+//     glue bead should start. Known immediately at the leading edge (same
+//     mechanism the old single distance already used), so this fires from
+//     the very first tube.
+//   - End Position: distance from the tube's TRAILING edge to where the
+//     glue bead should end. The trailing edge isn't knowable until a full
+//     tube has passed the presence sensor and its length has been
+//     measured -- see tubeLengthLearned/learnedTubeLengthMm below. Per
+//     spec: the first tube gets no End-position check; from the second
+//     tube on, the previous tube's measured length is used to project
+//     where the current tube's trailing edge will be.
+//
+// Both values are meant to be read from the HMI via RM (operator types
+// them into numeric input objects on the touchscreen) -- see
+// serviceHmiInputPolling() below. RM currently gets zero response from
+// this PT (see the NS12 field-report comment on why), so these start at
+// PLACEHOLDER fallback values and stay there, with
+// hotMeltPositionsFromHmi staying false, until that's resolved.
+static float hotMeltStartPositionMm = 150.0f; // PLACEHOLDER fallback
+static float hotMeltEndPositionMm = 10.0f;    // PLACEHOLDER fallback
+bool hotMeltPositionsFromHmi = false;
+
+// PLACEHOLDER: HMI numeric-input word scale unconfirmed against the real
+// CX-Designer project -- assumed here as plain integer mm (one $W count =
+// 1mm). If those input objects actually use a decimal-shifted scale (e.g.
+// x10 for 0.1mm resolution, matching the x10 convention already used
+// elsewhere in this file's telemetry), change this to match.
+constexpr float HMI_POSITION_MM_PER_COUNT = 1.0f;
+
+// Tube length, learned from the previous tube's presence-sensor
+// leading/trailing edge encoder distance (see handlePresenceEdge()).
+// Needed to project where the CURRENT tube's trailing edge will be, since
+// End Position above is referenced from that edge, not a fixed distance
+// from the presence sensor.
+float learnedTubeLengthMm = 0.0f;
+bool tubeLengthLearned = false;
+int64_t tubeEndEncoderCount = 0;
 
 // =====================================================================
 // Tube presence sensor -- ground-truth leading/trailing edge anchor.
@@ -880,9 +941,27 @@ constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 // safety net that never actually monitors anything live right now. Set
 // to 1 to re-enable -- required again if ENABLE_EXPERIMENTAL_32x24 is
 // ever turned on, since its auto-fallback has no data without this.
-#define NS12_ENABLE_RM_TEST_READ 0
-constexpr uint16_t TEST_READ_ADDR = 10;
-constexpr uint32_t TEST_READ_INTERVAL_MS = 300;
+// Renamed from NS12_ENABLE_RM_TEST_READ (V4.15.8): this poll now has a
+// real purpose -- reading the operator-entered HotMelt Start/End Position
+// values back from the HMI (see serviceHmiInputPolling() and
+// hotMeltStartPositionMm/hotMeltEndPositionMm below) -- not just
+// exercising the link for the (currently off) 32x24 auto-fallback.
+// Still OFF by default: RM gets zero response on this PT (117/117 clean
+// timeouts, field report above) -- current top suspect is CX-Designer's
+// Memory Link "Response" setting, documented as OFF in this project's
+// setup notes. If that's the actual switch controlling whether the PT
+// replies to RM at all (not just WM-write acknowledgment), flipping it
+// ON and re-downloading the PT project is the thing to try before
+// re-enabling this. Until RM works, hotMeltStartPositionMm/
+// hotMeltEndPositionMm stay on their PLACEHOLDER fallback values.
+#define NS12_ENABLE_RM_POLLING 0
+
+// PLACEHOLDER -- not confirmed against the real CX-Designer project. These
+// must match whatever $W words the HMI's "HotMelt Start Position" and
+// "HotMelt End Position" numeric input objects actually write to.
+constexpr uint16_t HOTMELT_START_POSITION_ADDR = 11;
+constexpr uint16_t HOTMELT_END_POSITION_ADDR = 12;
+constexpr uint32_t RM_POLL_INTERVAL_MS = 1000; // operator input changes rarely -- no need to poll fast
 
 // Hard protocol ceiling, not a tuning knob: the WM/RM wire format's LL
 // field is exactly 2 decimal digits (*L(2 dec) in the protocol reference),
@@ -922,7 +1001,6 @@ public:
     Serial2.setTxBufferSize(1024);
     Serial2.begin(NS12::BAUD, SERIAL_8N1, Pins::NS12_RX, Pins::NS12_TX);
     lastTelemetryMs = millis();
-    lastTestReadMs = millis();
   }
 
   // WM: write `count` words starting at `startAddr`. count > 99 is a
@@ -1012,37 +1090,44 @@ public:
   }
 
   // Must be called every loop() iteration. Drives the periodic telemetry
-  // push, the periodic low-rate test read (if NS12_ENABLE_RM_TEST_READ),
-  // and the non-blocking read state machine. Never blocks.
+  // push and the non-blocking read state machine. Never blocks. RM
+  // requests themselves are now driven externally by
+  // serviceHmiInputPolling() (see below), not from inside here -- this
+  // just needs to keep pumping pollPendingRead() regardless of who called
+  // requestRM().
   void service() {
     uint32_t now = millis();
 
     // Gated on !readPending: RM_READ_TIMEOUT_MS and
-    // TELEMETRY_WRITE_INTERVAL_MS are both 250-300ms, so a telemetry WM
-    // write could otherwise fire in the middle of an in-flight RM read on
-    // this shared half-visible UART. pollPendingRead() only checks that a
-    // byte stream starts at an ESC, not where it actually came from -- see
-    // the field-report comment on the NS12 namespace for why that matters
+    // TELEMETRY_WRITE_INTERVAL_MS are both 250-300ms (and the HMI input
+    // poll adds a third, slower request source), so a telemetry WM write
+    // could otherwise fire in the middle of an in-flight RM read on this
+    // shared half-visible UART. pollPendingRead() only checks that a byte
+    // stream starts at an ESC, not where it actually came from -- see the
+    // field-report comment on the NS12 namespace for why that matters
     // (every captured "RM response" so far had a WM-shaped header, before
     // this gating existed). This delays telemetry by at most one
-    // RM_READ_TIMEOUT_MS window, not lost. Harmless no-op with RM test
-    // reads disabled (readPending then never becomes true), left in place
-    // so re-enabling NS12_ENABLE_RM_TEST_READ doesn't need this back too.
+    // RM_READ_TIMEOUT_MS window, not lost. Harmless no-op with RM polling
+    // disabled (readPending then never becomes true).
     if (!readPending && now - lastTelemetryMs >= NS12::TELEMETRY_WRITE_INTERVAL_MS) {
       lastTelemetryMs = now;
       sendWM(NS12::TELEMETRY_BASE_ADDR, telemetry, NS12::TELEMETRY_WORD_COUNT);
     }
 
-#if NS12_ENABLE_RM_TEST_READ
-    if (!readPending && (now - lastTestReadMs >= NS12::TEST_READ_INTERVAL_MS)) {
-      lastTestReadMs = now;
-      requestRM(NS12::TEST_READ_ADDR, 1);
-    }
-#endif
-
     if (readPending) {
       pollPendingRead(now);
     }
+  }
+
+  // Pop semantics: returns true (once) for the most recently completed
+  // successful RM read, then clears until the next one lands. Written by
+  // parseRmResponse() on success; consumed by serviceHmiInputPolling().
+  bool consumeReadWord(uint16_t &addrOut, uint16_t &valueOut) {
+    if (!lastReadValid) return false;
+    addrOut = lastReadAddrValue;
+    valueOut = lastReadWordValue;
+    lastReadValid = false;
+    return true;
   }
 
   void setTelemetry(uint16_t heartbeat, uint16_t fpsX10, uint16_t minX10, uint16_t maxX10,
@@ -1078,7 +1163,6 @@ public:
 private:
   uint16_t telemetry[NS12::TELEMETRY_WORD_COUNT] = {};
   uint32_t lastTelemetryMs = 0;
-  uint32_t lastTestReadMs = 0;
 
   bool readPending = false;
   uint32_t readSentMs = 0;
@@ -1086,6 +1170,12 @@ private:
   uint8_t expectedCount = 0;
   char readLineBuffer[40] = {};
   size_t readLineUsed = 0;
+
+  // Set by parseRmResponse() on a successful parse, popped by
+  // consumeReadWord(). See that method's comment.
+  bool lastReadValid = false;
+  uint16_t lastReadAddrValue = 0;
+  uint16_t lastReadWordValue = 0;
 
   uint32_t rmAttempts = 0;
   uint32_t rmSuccesses = 0;
@@ -1219,9 +1309,13 @@ private:
       if (comma) *comma = '\0';
 
       char *endPtr = nullptr;
-      strtoul(dataText, &endPtr, 16);
+      unsigned long parsedValue = strtoul(dataText, &endPtr, 16);
       if (endPtr == dataText) continue;
-      return true; // test read only exercises the link right now
+
+      lastReadAddrValue = addr;
+      lastReadWordValue = (uint16_t)parsedValue;
+      lastReadValid = true;
+      return true;
     }
     return false;
   }
@@ -1566,7 +1660,8 @@ SystemState lastLoggedState = SystemState::Startup;
 
 // Per-tube one-shot trigger flags, reset on each new leading edge.
 bool tubeMlxArmed = false;
-bool tubeKeyenceFired = false;
+bool tubeKeyenceStartFired = false;
+bool tubeKeyenceEndFired = false;
 int64_t tubeStartEncoderCount = 0;
 uint32_t lastMcpPollMs = 0;
 uint32_t lastMlxFrameMs = 0;
@@ -1602,10 +1697,10 @@ void enterFaultStop() {
 }
 
 // =====================================================================
-// Position projection: fires the MLX capture arm and the Keyence trigger
-// at the configured lead distances ahead of the tube's leading edge, using
-// the encoder as the distance reference and the presence sensor as the
-// anchor.
+// Position projection: fires the MLX capture arm and the two Keyence
+// checks (Start/End of glue bead) at the configured lead distances ahead
+// of the tube's leading edge, using the encoder as the distance reference
+// and the presence sensor as the anchor.
 // =====================================================================
 void serviceTubePositionTracking() {
   if (state != SystemState::InspectingTube) return;
@@ -1616,9 +1711,30 @@ void serviceTubePositionTracking() {
     capture.rearm();
     tubeMlxArmed = true;
   }
-  if (!tubeKeyenceFired && travelledMm >= PRESENCE_TO_KEYENCE_DISTANCE_MM) {
+
+  // Start-of-glue check: referenced from the LEADING edge, known
+  // immediately -- fires from the very first tube.
+  if (!tubeKeyenceStartFired && travelledMm >= hotMeltStartPositionMm) {
     keyenceTrigger.fire();
-    tubeKeyenceFired = true;
+    tubeKeyenceStartFired = true;
+  }
+
+  // End-of-glue check: referenced from the TRAILING edge, which isn't
+  // knowable until a full tube has passed the presence sensor and its
+  // length has been measured (tubeLengthLearned, set in
+  // handlePresenceEdge() below). Stays un-fired for the entire first
+  // tube; from the second tube on, uses the previous tube's measured
+  // length to compute where this tube's trailing edge will be.
+  if (tubeLengthLearned && !tubeKeyenceEndFired) {
+    float endTriggerMm = learnedTubeLengthMm - hotMeltEndPositionMm;
+    if (travelledMm >= endTriggerMm) {
+      // Both checks share one KeyenceTrigger with a single pending-pulse
+      // slot -- fine as long as Start/End are far enough apart in travel
+      // distance to not overlap the 500us pulse, true for any plausible
+      // tube length and line speed.
+      keyenceTrigger.fire();
+      tubeKeyenceEndFired = true;
+    }
   }
 }
 
@@ -1632,14 +1748,67 @@ void handlePresenceEdge() {
       state = SystemState::InspectingTube;
       tubeStartEncoderCount = encoder.total();
       tubeMlxArmed = false;
-      tubeKeyenceFired = false;
+      tubeKeyenceStartFired = false;
+      tubeKeyenceEndFired = false;
     }
   } else {
-    // Trailing edge -- tube has cleared the zone.
+    // Trailing edge -- tube has cleared the zone. Measure this tube's
+    // length now (leading-to-trailing encoder distance) for the NEXT
+    // tube's End-position projection -- see hotMeltEndPositionMm comment.
     if (state == SystemState::InspectingTube) {
+      tubeEndEncoderCount = encoder.total();
+      learnedTubeLengthMm =
+          (float)(tubeEndEncoderCount - tubeStartEncoderCount) / ENCODER_COUNTS_PER_MM;
+      bool hadNoEndCheck = !tubeKeyenceEndFired;
+      tubeLengthLearned = true;
+      if (hadNoEndCheck) {
+        Serial.printf("[QC] Tube cleared without an End-position check -- measured length "
+                      "%.1fmm now available for the next tube.\n",
+                      learnedTubeLengthMm);
+      }
       state = SystemState::TubeGap;
     }
   }
+}
+
+// =====================================================================
+// HMI input polling -- rotates a low-rate RM read between the two
+// operator-entered position words (HOTMELT_START_POSITION_ADDR,
+// HOTMELT_END_POSITION_ADDR) and routes any successful result into
+// hotMeltStartPositionMm/hotMeltEndPositionMm. Entirely inert while
+// NS12_ENABLE_RM_POLLING is 0 (the default -- RM gets zero response from
+// this PT right now, see the NS12 namespace field-report comment): no
+// request ever goes out, so the fallback PLACEHOLDER values above stay in
+// effect and hotMeltPositionsFromHmi stays false. Safe to call
+// unconditionally from loop() either way.
+// =====================================================================
+#if NS12_ENABLE_RM_POLLING
+uint32_t lastHmiPollMs = 0;
+uint8_t nextHmiPollIndex = 0;
+#endif
+
+void serviceHmiInputPolling() {
+#if NS12_ENABLE_RM_POLLING
+  uint32_t now = millis();
+  if (!ns12.isReadPending() && now - lastHmiPollMs >= NS12::RM_POLL_INTERVAL_MS) {
+    lastHmiPollMs = now;
+    uint16_t addr = (nextHmiPollIndex == 0) ? NS12::HOTMELT_START_POSITION_ADDR
+                                             : NS12::HOTMELT_END_POSITION_ADDR;
+    ns12.requestRM(addr, 1);
+    nextHmiPollIndex = (nextHmiPollIndex + 1) % 2;
+  }
+
+  uint16_t addr, value;
+  if (ns12.consumeReadWord(addr, value)) {
+    if (addr == NS12::HOTMELT_START_POSITION_ADDR) {
+      hotMeltStartPositionMm = (float)value * HMI_POSITION_MM_PER_COUNT;
+      hotMeltPositionsFromHmi = true;
+    } else if (addr == NS12::HOTMELT_END_POSITION_ADDR) {
+      hotMeltEndPositionMm = (float)value * HMI_POSITION_MM_PER_COUNT;
+      hotMeltPositionsFromHmi = true;
+    }
+  }
+#endif
 }
 
 void handleKeyenceResult() {
@@ -1714,15 +1883,23 @@ void printDiagnostics() {
   Serial.printf("NS12 WM attempts/failures/oversized : %lu / %lu / %lu\n",
                 (unsigned long)ns12.wmAttemptCount(), (unsigned long)ns12.wmFailureCount(),
                 (unsigned long)ns12.wmOversizedCountValue());
-#if NS12_ENABLE_RM_TEST_READ
+#if NS12_ENABLE_RM_POLLING
   Serial.printf("NS12 RM attempts/success/writeFail/timeout/parseErr : %lu / %lu / %lu / %lu / %lu\n",
                 (unsigned long)ns12.rmAttemptCount(), (unsigned long)ns12.rmSuccessCount(),
                 (unsigned long)ns12.rmWriteFailureCount(), (unsigned long)ns12.rmTimeoutCount(),
                 (unsigned long)ns12.rmParseErrorCount());
 #else
-  Serial.println(F("NS12 RM test read  : disabled (PT doesn't respond -- see NS12 namespace comment)"));
+  Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
   Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
+  Serial.printf("HotMelt Start/End position (mm) : %.1f / %.1f (%s)\n",
+                hotMeltStartPositionMm, hotMeltEndPositionMm,
+                hotMeltPositionsFromHmi ? "from HMI" : "PLACEHOLDER fallback, not from HMI yet");
+  if (tubeLengthLearned) {
+    Serial.printf("Tube length          : %.1f mm (from previous tube)\n", learnedTubeLengthMm);
+  } else {
+    Serial.println(F("Tube length          : not yet learned (no tube has cleared the sensor yet)"));
+  }
   Serial.printf("Free heap          : %.1f kB\n", ESP.getFreeHeap() / 1024.0f);
 }
 
@@ -1901,6 +2078,7 @@ void loop() {
   }
 
   serviceTubePositionTracking();
+  serviceHmiInputPolling();
 
   // MCP polled only during Standby/TubeGap, ~20ms cadence -- see the
   // KEYENCE_RESULT_PIN comment for why InspectingTube-critical signals
