@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.10
+// Ref: TGIS-510_cpp_V4_15.11
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -241,6 +241,29 @@
 // the next real capture. 'R' now also pushes an explicit all-minimum
 // (coldest palette bucket) frame, making it an actual visible reset.
 //
+// FIELD UPDATE (V4.15.11): the V4.15.10 RM offset test came back from real
+// hardware: "112 / 108 / 0 / 0 / 4" (attempts/success/writeFail/timeout/
+// parseErr) -- 0 timeouts, 96% success, versus 117/117 clean timeouts
+// before. RM_WORD_ADDRESS_OFFSET=16384 is CONFIRMED correct for this PT/
+// project, not just a hypothesis anymore. Diagnostics also showed
+// "HotMelt Start/End position (mm) : 33.0 / 34.0 (from HMI)" -- real
+// operator-entered values, confirming HOTMELT_START_POSITION_ADDR=11 and
+// HOTMELT_END_POSITION_ADDR=12 are correct too. Cross-checked against the
+// real CX-Designer Symbol Table (project 510_HotMel_20260902_1): confirmed
+// no other object is bound to $W11/$W12; used words nearby are $W0-$W5,
+// $HW0, $W10, $W500-$W505, $W700+ (matrix) -- so $W13-$W499 and
+// $W506-$W699 are free for future host reads, address budget permitting
+// (still needs the same real-project check before use, same as $W11/$W12
+// did). Also confirmed from that same symbol table: $B (bit), $W (word),
+// $HB and $HW (retentive versions) are independent address spaces on this
+// PT, not different views onto the same memory -- $W0 (AutoGen2) and $HW0
+// (AutoGen8) already coexist at "address 0" with no conflict, and likewise
+// $B10/$B20 sit alongside $W10/$W500s. Not yet investigated: the 4/112 RM
+// parse errors (doesn't block operation -- a failed read is just skipped
+// and retried next poll cycle) and the HMI_POSITION_MM_PER_COUNT=1.0f
+// scale assumption (addresses are now confirmed; whether raw HMI counts
+// map 1:1 to mm has not been checked against a physical measurement).
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -272,10 +295,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.10"
+#define FW_VERSION_STRING "V4.15.11"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_10.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_11.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -992,15 +1015,22 @@ constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 // hypothesis (see that constant in the NS12 namespace below) -- RM had
 // gotten zero response on this PT (117/117 clean timeouts) with the
 // "Response=OFF" theory ruled out (screenshot confirmed Response is ON).
-// If RM attempts still show 100% timeouts with the offset applied, that
-// rules the offset theory out too and this should go back to 0 pending a
-// new hypothesis. Until RM works, hotMeltStartPositionMm/
-// hotMeltEndPositionMm stay on their PLACEHOLDER fallback values.
+// CONFIRMED (V4.15.11): real hardware diagnostics came back
+// "112 / 108 / 0 / 0 / 4" (attempts/success/writeFail/timeout/parseErr) --
+// 0 timeouts, 96% success. The offset theory was correct. 4/112 parse
+// errors remain unexplained -- not investigated yet, doesn't block normal
+// operation since consumeReadWord() just skips a failed read and tries
+// again next poll cycle.
 #define NS12_ENABLE_RM_POLLING 1
 
-// PLACEHOLDER -- not confirmed against the real CX-Designer project. These
-// must match whatever $W words the HMI's "HotMelt Start Position" and
-// "HotMelt End Position" numeric input objects actually write to.
+// CONFIRMED (V4.15.11) on real hardware: diagnostics showed
+// "HotMelt Start/End position (mm) : 33.0 / 34.0 (from HMI)" -- real
+// operator-entered values, not the PLACEHOLDER fallback (150.0/10.0) --
+// once RM_WORD_ADDRESS_OFFSET actually got RM responding. Cross-checked
+// against the real CX-Designer symbol table (Symbol Table screenshot,
+// 510_HotMel_20260902_1 project): no other object is bound to $W11 or
+// $W12 (used words nearby: $W0-$W5, $HW0, $W10, $W500-$W505, $W700+ for
+// the matrix), so no conflict either. No longer a placeholder guess.
 constexpr uint16_t HOTMELT_START_POSITION_ADDR = 11;
 constexpr uint16_t HOTMELT_END_POSITION_ADDR = 12;
 constexpr uint32_t RM_POLL_INTERVAL_MS = 1000; // operator input changes rarely -- no need to poll fast
@@ -1052,9 +1082,18 @@ constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
 //
 // COULD NOT VERIFY against the official Host Connection Manual (Cat. No.
 // V085-E1-07) -- WebFetch to every candidate manual/documentation host
-// was blocked by this sandbox's network egress policy. This is reasoned
+// was blocked by this sandbox's network egress policy. This was reasoned
 // from the available evidence, not confirmed against primary
-// documentation. Do not trust it over an actual test.
+// documentation, at the time it was written.
+//
+// CONFIRMED (V4.15.11) by an actual hardware test, which is a better
+// answer than the manual would have been anyway: real diagnostics with
+// this offset applied and NS12_ENABLE_RM_POLLING=1 came back
+// "112 / 108 / 0 / 0 / 4" (attempts/success/writeFail/timeout/parseErr) --
+// 0 timeouts, 96% success, versus 117/117 clean timeouts before. The
+// offset theory is correct for this PT/project. Whether WM also needs it
+// has not been tested (see the RM-only rationale below) and should stay
+// that way unless WM traffic itself shows a problem.
 //
 // RM-only, deliberately NOT applied to WM (see sendWM): WM writes already
 // get transport-level acks with plain (unoffset) addresses -- there is no
@@ -1064,13 +1103,13 @@ constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
 // out to be real and WM also needs it, that's a separate, deliberate change
 // once RM confirms the theory -- not bundled in here.
 //
-// V4.15.10 FIELD TEST: set to 16384 (was 0) together with
-// NS12_ENABLE_RM_POLLING=1 below, to test whether RM finally gets ANY
-// response reading, e.g., $W11 at wire address 11+16384=16395 instead of
-// plain 11. Applied once, centrally, here -- every $Wn address elsewhere in
-// this file stays written as its plain CX-Designer label; only the wire-
-// encoded value changes. Revert to 0 if this does not fix RM (rules the
-// theory out) or WM needs its own copy of it if it does.
+// CONFIRMED (V4.15.11) on real hardware: with this set to 16384 and
+// NS12_ENABLE_RM_POLLING=1, RM went from 117/117 clean timeouts to
+// 108/112 successful reads (0 timeouts). $W11 (HOTMELT_START_POSITION_ADDR)
+// really is at wire address 11+16384=16395, not plain 11. Applied once,
+// centrally, here -- every $Wn address elsewhere in this file stays
+// written as its plain CX-Designer label; only the wire-encoded value
+// changes. Do not revert to 0 -- that was the pre-fix, all-timeouts state.
 constexpr uint16_t RM_WORD_ADDRESS_OFFSET = 16384;
 } // namespace NS12
 
