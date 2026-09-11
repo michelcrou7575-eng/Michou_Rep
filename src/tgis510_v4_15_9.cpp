@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.8
+// Ref: TGIS-510_cpp_V4_15.9
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -199,6 +199,25 @@
 // project) and the HMI numeric input's count-to-mm scale
 // (HMI_POSITION_MM_PER_COUNT, assumed 1:1).
 //
+// FIELD UPDATE (V4.15.9): real screenshot of CX-Designer's Comm. Setting
+// screen (Serial Port A / Memory Link) rules out the Response=OFF theory
+// above -- Response is confirmed ON. But the same screenshot surfaces a
+// field this project had never looked at: "Start Communication $W:
+// 16384". Reasoned hypothesis, NOT verified against the official Host
+// Connection Manual (Cat. No. V085-E1-07) -- every candidate manual/
+// documentation host was blocked by this sandbox's network egress
+// policy, so this could not be confirmed against primary documentation:
+// if that field defines an offset between a $Wn object's CX-Designer
+// label and its actual Memory Link wire address, it would explain the
+// exact WM-succeeds/RM-never-responds asymmetry seen throughout this
+// project. Added NS12::WORD_ADDRESS_OFFSET (default 0, i.e. unchanged
+// behavior) applied centrally in sendWM()/requestRM()/consumeReadWord()
+// so every $Wn address elsewhere in this file stays written as its plain
+// label regardless of the offset setting. Set it to 16384 (and
+// NS12_ENABLE_RM_POLLING to 1) to actually test this on real hardware --
+// that's a faster, more reliable answer than continuing to reason about
+// it without access to the manual.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -230,10 +249,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.8"
+#define FW_VERSION_STRING "V4.15.9"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_8.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_9.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -993,6 +1012,34 @@ constexpr uint32_t COLUMN_FRAME_TX_TIME_US =
     (uint32_t)COLUMN_FRAME_BYTES * 10UL * 1000000UL / (uint32_t)BAUD;
 constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
     (COLUMN_FRAME_TX_TIME_US * 3UL / 2UL) / 1000UL + 1UL; // +50% margin, ceil to ms
+
+// PLACEHOLDER, UNVERIFIED HYPOTHESIS (V4.15.9): CX-Designer's own Comm.
+// Setting screen (Serial Port A / Memory Link) shows a real, screenshot-
+// confirmed field: "Start Communication $W: 16384". This project had
+// never looked at that field before. If it defines an offset between a
+// $Wn object's CX-Designer label and its actual Memory Link wire address,
+// it would explain the exact asymmetry seen throughout this project's
+// history: WM writes "succeed" at the transport level even when aimed at
+// the wrong location (nothing surfaces as an error from writing
+// somewhere unintended), while RM appears to strictly validate the
+// address and simply never respond outside it (0/117 responses, zero
+// exceptions, never a malformed reply once the write/read overlap bug
+// was fixed). That fits better than the "Response=OFF" theory this
+// replaces -- Response is confirmed ON in the same screenshot.
+//
+// COULD NOT VERIFY against the official Host Connection Manual (Cat. No.
+// V085-E1-07) -- WebFetch to every candidate manual/documentation host
+// was blocked by this sandbox's network egress policy. This is reasoned
+// from the available evidence, not confirmed against primary
+// documentation. Do not trust it over an actual test.
+//
+// Set to 16384 to test: does RM finally get ANY response reading, e.g.,
+// $W10 at wire address 10+16384=16394 instead of plain 10? Requires also
+// setting NS12_ENABLE_RM_POLLING to 1 below so a request actually goes
+// out. Applied once, centrally, here -- every $Wn address elsewhere in
+// this file stays written as its plain CX-Designer label; only the wire-
+// encoded value changes. Default 0 keeps current (unchanged) behavior.
+constexpr uint16_t WORD_ADDRESS_OFFSET = 0;
 } // namespace NS12
 
 class NS12Manager {
@@ -1019,7 +1066,9 @@ public:
     frame[n++] = 'W';
     frame[n++] = 'M';
     frame[n++] = '0';
-    n += writeHex4(&frame[n], startAddr);
+    // See NS12::WORD_ADDRESS_OFFSET -- 0 by default, so this is a no-op
+    // unless that's being tested.
+    n += writeHex4(&frame[n], (uint16_t)(startAddr + NS12::WORD_ADDRESS_OFFSET));
     n += writeDecimal2(&frame[n], (uint8_t)count);
     for (uint16_t i = 0; i < count; i++) {
       if (i > 0) frame[n++] = ',';
@@ -1054,13 +1103,20 @@ public:
   bool requestRM(uint16_t startAddr, uint8_t count) {
     if (readPending || count == 0 || count > 32) return false;
 
+    // See NS12::WORD_ADDRESS_OFFSET -- 0 by default, so this is a no-op
+    // unless that's being tested. wireAddr (not the caller's plain
+    // startAddr) is what's actually sent AND what the response is
+    // validated against below, since the PT would echo back whatever
+    // address it actually processed.
+    uint16_t wireAddr = (uint16_t)(startAddr + NS12::WORD_ADDRESS_OFFSET);
+
     char frame[16];
     size_t n = 0;
     frame[n++] = (char)NS12::ESC;
     frame[n++] = 'R';
     frame[n++] = 'M';
     frame[n++] = '0';
-    n += writeHex4(&frame[n], startAddr);
+    n += writeHex4(&frame[n], wireAddr);
     n += writeDecimal2(&frame[n], count);
     frame[n++] = '\r';
 
@@ -1084,7 +1140,7 @@ public:
     readPending = true;
     readSentMs = millis();
     readLineUsed = 0;
-    expectedAddr = startAddr;
+    expectedAddr = wireAddr; // matched against the response's own address field, which is the wire address
     expectedCount = count;
     return true;
   }
@@ -1122,9 +1178,13 @@ public:
   // Pop semantics: returns true (once) for the most recently completed
   // successful RM read, then clears until the next one lands. Written by
   // parseRmResponse() on success; consumed by serviceHmiInputPolling().
+  // addrOut is translated back to the caller's plain $Wn label (WIRE
+  // address minus NS12::WORD_ADDRESS_OFFSET) -- the offset, if any, stays
+  // entirely internal to this class; external code never has to think
+  // about it, in either direction.
   bool consumeReadWord(uint16_t &addrOut, uint16_t &valueOut) {
     if (!lastReadValid) return false;
-    addrOut = lastReadAddrValue;
+    addrOut = (uint16_t)(lastReadAddrValue - NS12::WORD_ADDRESS_OFFSET);
     valueOut = lastReadWordValue;
     lastReadValid = false;
     return true;
