@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.12
+// Ref: TGIS-510_cpp_V4_15.14
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -291,6 +291,48 @@
 // exercises this, the same way RM_WORD_ADDRESS_OFFSET went from
 // hypothesis (V4.15.9/10) to confirmed (V4.15.11).
 //
+// FIELD UPDATE (V4.15.13): the V4.15.12 RB/WB build ran on real hardware --
+// diagnostics came back "HMI buttons ... : 1/1/1/1/1", all 5 permanently
+// "pressed" (only one setActiveLamp() call ever fired, per WB attempts
+// staying at exactly BUTTON_COUNT=5 across dumps -- i.e. one 0->1 edge per
+// button, then stuck, not flickering). Physically implausible -- no
+// operator holds 5 buttons down continuously -- so this is a read/parse
+// bug, not real presses. RB success rate (358/511, ~70%) is also
+// meaningfully worse than RM's (112/123, ~91%) under the same traffic, and
+// raw captures already show stray bytes shaped like our own WM traffic
+// bleeding into a pending RB's response ("[ESC]WM001F" -- correctly
+// rejected by the pendingCmdType check, but proves collisions are
+// frequent at this address/traffic mix). Leading suspects, not yet
+// distinguished: (1) genuine PT replies whose bit-value field isn't a
+// plain "0"/"1" the way parseReadResponse() assumes, so it's finding SOME
+// nonzero value every time even at rest; (2) our own outgoing RB request
+// echoing back on this link (as WM traffic already does per the pre-
+// V4.15.4 field report) with just enough trailing garbage after it to
+// pass the dataLen>0 check, producing a spuriously nonzero "value" from
+// noise, consistently rather than randomly. Added a raw-bytes dump on
+// parseReadResponse() SUCCESS (mirroring dumpRejectedLine(), which only
+// covered failures) so the next hardware run shows exactly what's being
+// matched -- that answers which theory is right instead of guessing
+// further. Do not trust HMI button state or lamp behavior until that
+// capture is reviewed; TEST/DIAG button dispatch stays wired (so it's
+// visible when it misfires) but should be treated as unverified.
+//
+// FIELD UPDATE (V4.15.14): the stuck-at-1, never-flickering symptom above
+// has a much simpler explanation than a wiring/echo issue -- CX-Designer
+// momentary bit switches are commonly "host-clear": the panel SETS the
+// bit on press and relies on the connected device to clear it back to 0,
+// guaranteeing a command isn't missed even under slow host polling. This
+// firmware only ever read the buttons, never wrote them back, so the very
+// first tap on each would latch it at 1 forever -- exactly what V4.15.12
+// showed. serviceHmiButtonPolling() now clears a button's bit back to 0
+// (via sendWB) immediately after dispatching its press. The separate
+// finding from V4.15.13 (own-WM-traffic bytes bleeding into pending RB
+// reads, ~30% of attempts) is still real and still unexplained -- this
+// fix addresses why buttons read "always pressed", not why some fraction
+// of RB reads fail outright. The raw-bytes-on-success dump added in
+// V4.15.13 stays in place to keep validating that the 70% of RB reads
+// reported as successful are genuine PT replies.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -322,10 +364,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.12"
+#define FW_VERSION_STRING "V4.15.14"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_12.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_14.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1159,10 +1201,18 @@ constexpr uint16_t BIT_ADDRESS_OFFSET = 16384;
 
 // HMI push-button inputs, confirmed from the real CX-Designer Symbol Table
 // (project 510_HotMel_20260902_1, I/O Comments "SETUP Button" / "ALARM LOG
-// Button" / "TREND FULL Button" / "TEST Button" / "DIAG Button"). ESP32
-// only ever reads these via RB -- never writes them back, since the touch
-// panel itself owns setting/clearing its own switch bit; writing to it
-// would fight the panel's own control of it.
+// Button" / "TREND FULL Button" / "TEST Button" / "DIAG Button").
+//
+// CORRECTED (V4.15.14): originally assumed read-only (touch panel owns
+// setting/clearing its own bit). Real hardware showed all 5 stuck
+// permanently at 1 after a single tap each, never flickering -- exactly
+// what a "momentary, host-clear" CX-Designer bit switch does: the panel
+// SETS the bit on press and relies on the connected device to clear it
+// back to 0, precisely so a command isn't missed under slow host polling.
+// ESP32 now writes each bit back to 0 (via sendWB, see
+// serviceHmiButtonPolling()) immediately after dispatching its press --
+// an acknowledge, not a fight with the panel, since the panel's own next
+// press is what sets it again.
 constexpr uint16_t BUTTON_SETUP_ADDR = 30;
 constexpr uint16_t BUTTON_ALARM_LOG_ADDR = 31;
 constexpr uint16_t BUTTON_TREND_FULL_ADDR = 32;
@@ -1665,6 +1715,30 @@ private:
       lastReadWordValue = (uint16_t)parsedValue;
       lastReadKind = (pendingCmdType == 'B') ? ReadKind::Bit : ReadKind::Word;
       lastReadValid = true;
+#if NS12_DEBUG_RAW_RX
+      // V4.15.13: RB successes need the same raw-bytes visibility failures
+      // already had (dumpRejectedLine) -- added after real hardware showed
+      // all 5 HMI buttons reading permanently pressed, which is physically
+      // implausible and needs to be told apart from "PT genuinely replied,
+      // just not with a plain 0/1" vs "this 'success' is actually our own
+      // RB request (or WM/telemetry traffic) echoing back and coincidentally
+      // satisfying the addr/count match." Only that raw evidence answers it.
+      Serial.print(F("[NS12] R"));
+      Serial.print(pendingCmdType);
+      Serial.print(F(" success, offset="));
+      Serial.print(offset);
+      Serial.print(F(", addr="));
+      Serial.print(addr, HEX);
+      Serial.print(F(", count="));
+      Serial.print(count);
+      Serial.print(F(", value="));
+      Serial.print(parsedValue, HEX);
+      Serial.print(F(", raw ("));
+      Serial.print(len);
+      Serial.print(F(" bytes): "));
+      for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
+      Serial.println();
+#endif
       return true;
     }
     return false;
@@ -2367,6 +2441,15 @@ void serviceHmiButtonPolling() {
       buttonState[i] = pressed;
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
+        // Acknowledge -- clear the switch's own bit back to 0 (V4.15.14,
+        // see BUTTON_SETUP_ADDR's comment). Fire-and-forget like every
+        // other WB; also clear buttonState[i] locally right away rather
+        // than waiting for the bit's next RB poll to confirm the clear
+        // landed, so the very next real press is detected as a fresh edge
+        // without an extra poll-cycle's delay.
+        bool clearBit = false;
+        ns12.sendWB(kButtonAddrs[i], &clearBit, 1);
+        buttonState[i] = false;
       }
       break;
     }
