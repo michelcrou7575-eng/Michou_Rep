@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.15
+// Ref: TGIS-510_cpp_V4_15.16
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -356,6 +356,23 @@
 // bytes from another overlapping transmission -- one sample isn't enough
 // to tell, and no code change follows from it yet. Watch for it recurring.
 //
+// FIELD UPDATE (V4.15.16): user confirmed real button presses (ALARM LOG,
+// TEST) worked correctly on V4.15.15 -- detected, dispatched, cleared --
+// but the lamp never visibly lit on the actual HMI. A CX-Designer
+// screenshot of the real TEST button object (PB0088) settled the address
+// question for good: Write Address $B33 (matches BUTTON_TEST_ADDR),
+// Display Address1 $B43 (matches LAMP_TEST_ADDR exactly), Action Type
+// Momentary (confirms the host-clear theory from V4.15.14), button type
+// "Select Shape(Type2-1)" -- shape lights purely from Display Address1's
+// ON/OFF. So the addressing and architecture were right; the bug was
+// applying RB_BIT_ADDRESS_OFFSET to WB as well as RB. This is the exact
+// asymmetry already known from $W (RM needs the offset, WM does not) --
+// V4.15.12 missed applying that same precedent to $B. WB now writes the
+// plain address, matching sendWM. If lamps still don't light after this,
+// the next suspect is Display Address1 needing an inverted or different
+// value convention than a plain 0/1 bit -- but try this first, since it's
+// the same fix that was already proven necessary for $W.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -387,10 +404,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.15"
+#define FW_VERSION_STRING "V4.15.16"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_15.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_16.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1213,14 +1230,24 @@ constexpr uint16_t RM_WORD_ADDRESS_OFFSET = 16384;
 // Setting screen (same screenshot RM_WORD_ADDRESS_OFFSET came from) also
 // lists "Start Communication $B: 16384" -- $B (bit) memory has its own
 // offset field, separate from $W's, that happens to carry the same value
-// in this project. Reused here as the starting hypothesis for both RB
-// (button reads) and WB (lamp writes) since neither has been tested on
-// real hardware yet -- unlike RM_WORD_ADDRESS_OFFSET, there is no already-
-// working $B write to protect by leaving WB unoffset, so both directions
-// get the same treatment. Confirm/revise from the first real RB/WB
-// diagnostics capture, the same way the $W offset was confirmed in
-// V4.15.11.
-constexpr uint16_t BIT_ADDRESS_OFFSET = 16384;
+// in this project.
+//
+// CONFIRMED for RB (V4.15.13/15): real RB reads with this offset applied
+// got exact address+count matches against real hardware (e.g. requesting
+// $B31+16384=16415=0x401F got back a reply whose own address field read
+// "401F") -- the wire address really is offset for reads, same as $W's.
+//
+// RENAMED to RB_BIT_ADDRESS_OFFSET (V4.15.16) and REMOVED from WB: V4.15.12
+// applied this to both RB and WB on the reasoning that WB was untested so
+// there was nothing already-working to protect (unlike WM, deliberately
+// left unoffset for exactly that reason). That reasoning missed the
+// established precedent sitting right next to it -- RM needs the $W offset
+// but WM does not -- and real hardware bore out the same asymmetry for
+// bits: a confirmed CX-Designer button (Write $B33 / Display Address1
+// $B43, "TEST", Momentary) showed WB0 lamp writes at the offset address
+// (0x4028 = 40+16384) producing no visible change at all. WB now writes
+// the plain address, mirroring sendWM -- see that function's comment.
+constexpr uint16_t RB_BIT_ADDRESS_OFFSET = 16384;
 
 // HMI push-button inputs, confirmed from the real CX-Designer Symbol Table
 // (project 510_HotMel_20260902_1, I/O Comments "SETUP Button" / "ALARM LOG
@@ -1382,11 +1409,11 @@ public:
   // by pendingCmdType so the response validates against 'B' instead of 'M'
   // and completion counts into the separate rb* counters. Introduced
   // V4.15.12 for the HMI push-buttons ($B30-$B34) -- see
-  // NS12::BIT_ADDRESS_OFFSET for the address-offset rationale.
+  // NS12::RB_BIT_ADDRESS_OFFSET for the address-offset rationale.
   bool requestRB(uint16_t startAddr, uint8_t count) {
     if (readPending || count == 0 || count > 32) return false;
 
-    uint16_t wireAddr = (uint16_t)(startAddr + NS12::BIT_ADDRESS_OFFSET);
+    uint16_t wireAddr = (uint16_t)(startAddr + NS12::RB_BIT_ADDRESS_OFFSET);
 
     char frame[16];
     size_t n = 0;
@@ -1423,11 +1450,17 @@ public:
   }
 
   // WB: write `count` bits starting at `startAddr`. Fire-and-forget, same
-  // shape as sendWM() -- no response expected. Introduced V4.15.12 for the
-  // HMI push-button lamps ($B40-$B44 PLACEHOLDER). Uses
-  // NS12::BIT_ADDRESS_OFFSET (unlike sendWM, which deliberately stays
-  // unoffset) since there is no already-working $B write to protect --
-  // see the offset's own comment in the NS12 namespace.
+  // shape as sendWM() -- no response expected.
+  //
+  // CORRECTED (V4.15.16): originally applied RB_BIT_ADDRESS_OFFSET here
+  // too (V4.15.12), reasoning that WB was untested so there was nothing
+  // already-working to protect by leaving it unoffset -- unlike sendWM.
+  // That missed the precedent sitting right next to it: RM needs the $W
+  // offset but WM does not. Real hardware confirmed the same asymmetry for
+  // bits -- a confirmed CX-Designer button (Write $B33 / Display Address1
+  // $B43, "TEST", Momentary) showed zero visible lamp change while WB was
+  // writing to the offset address (0x4028). WB now writes the plain
+  // address, matching sendWM.
   void sendWB(uint16_t startAddr, const bool *bits, uint8_t count) {
     if (count > NS12::MAX_WB_BITS) {
       count = NS12::MAX_WB_BITS;
@@ -1439,7 +1472,7 @@ public:
     frame[n++] = 'W';
     frame[n++] = 'B';
     frame[n++] = '0';
-    n += writeHex4(&frame[n], (uint16_t)(startAddr + NS12::BIT_ADDRESS_OFFSET));
+    n += writeHex4(&frame[n], startAddr);
     n += writeDecimal2(&frame[n], count);
     for (uint8_t i = 0; i < count; i++) {
       if (i > 0) frame[n++] = ',';
@@ -1525,7 +1558,7 @@ public:
   // intended bit regardless of what's in the rest of the word.
   bool consumeReadBit(uint16_t &addrOut, bool &valueOut) {
     if (!lastReadValid || lastReadKind != ReadKind::Bit) return false;
-    addrOut = (uint16_t)(lastReadAddrValue - NS12::BIT_ADDRESS_OFFSET);
+    addrOut = (uint16_t)(lastReadAddrValue - NS12::RB_BIT_ADDRESS_OFFSET);
     valueOut = (lastReadWordValue & 1) != 0;
     lastReadValid = false;
     return true;
