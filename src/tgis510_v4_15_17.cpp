@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.16
+// Ref: TGIS-510_cpp_V4_15.17
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -373,6 +373,23 @@
 // value convention than a plain 0/1 bit -- but try this first, since it's
 // the same fix that was already proven necessary for $W.
 //
+// FIELD UPDATE (V4.15.17): V4.15.16 field data still showed a familiar
+// failure -- "[ESC]WM001F" bleeding into a pending RM read right after a
+// burst of matrix column writes, RM down to 67% and RB to 48% (both worse
+// than RM's pre-button ~91-96% baseline). Root cause older than the
+// buttons: sendWM()/sendWB() are deliberately non-blocking (no flush(),
+// so InspectingTube's Keyence/encoder timing never stalls), so a write's
+// bytes can still be physically draining off the wire when a read request
+// starts a few loop() iterations later -- and this link has echoed its own
+// TX back onto RX since before V4.15.4's original write/read-overlap fix.
+// Added NS12Manager::markTxBusy(), called from sendWM()/sendWB(), which
+// estimates (from frame byte count and NS12::BAUD) when the just-queued
+// send will actually finish draining, accumulating across back-to-back
+// sends the way a real UART FIFO would. requestRM()/requestRB() now defer
+// (return false, retried on their normal poll schedule) until that
+// estimate passes -- entirely non-blocking, so it cannot introduce the
+// Keyence 100us-pulse jitter an actual flush() would risk.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -404,10 +421,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.16"
+#define FW_VERSION_STRING "V4.15.17"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_16.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_17.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1350,6 +1367,7 @@ public:
     }
     // Blocking flush() intentionally not used for WM -- a stalled TX flush
     // here would block the whole control loop during InspectingTube.
+    markTxBusy(n);
   }
 
   // RM: request `count` words (max 32) starting at `startAddr`. Sends the
@@ -1360,6 +1378,10 @@ public:
   // loop() iteration to drive the response state machine.
   bool requestRM(uint16_t startAddr, uint8_t count) {
     if (readPending || count == 0 || count > 32) return false;
+    // See markTxBusy()'s comment: defer starting a read until any recent
+    // WM/WB send is estimated to have actually finished draining off the
+    // wire, not just been handed to Serial2.write().
+    if ((int32_t)(millis() - txBusyUntilMs) < 0) return false;
 
     // See NS12::RM_WORD_ADDRESS_OFFSET -- currently 16384 under field test.
     // wireAddr (not the caller's plain startAddr) is what's actually sent
@@ -1412,6 +1434,7 @@ public:
   // NS12::RB_BIT_ADDRESS_OFFSET for the address-offset rationale.
   bool requestRB(uint16_t startAddr, uint8_t count) {
     if (readPending || count == 0 || count > 32) return false;
+    if ((int32_t)(millis() - txBusyUntilMs) < 0) return false; // see markTxBusy()
 
     uint16_t wireAddr = (uint16_t)(startAddr + NS12::RB_BIT_ADDRESS_OFFSET);
 
@@ -1492,6 +1515,7 @@ public:
       wbFailures++;
     }
     // No blocking flush -- same rationale as sendWM(): never stall the loop.
+    markTxBusy(n);
   }
 
   // Must be called every loop() iteration. Drives the periodic telemetry
@@ -1641,8 +1665,36 @@ private:
   uint32_t wbFailures = 0;
   uint32_t wbOversizedCount = 0;
 
+  // V4.15.17: estimated millis() timestamp when the most recent WM/WB send
+  // will have actually finished draining off the wire (not just been
+  // handed to Serial2.write(), which returns immediately -- see sendWM()'s
+  // "no blocking flush" comment). requestRM()/requestRB() defer starting a
+  // new read until this passes.
+  uint32_t txBusyUntilMs = 0;
+
   void clearRxBuffer() {
     while (Serial2.available() > 0) Serial2.read();
+  }
+
+  // Called from sendWM()/sendWB() right after Serial2.write(). Root cause
+  // this addresses: those writes are deliberately non-blocking (no
+  // flush()), so their bytes can still be physically draining off the wire
+  // when a read request starts a few loop() iterations later -- and this
+  // link has always echoed/leaked its own transmitted bytes back onto RX
+  // (established since before V4.15.4's write/read-overlap fix, and still
+  // visible in V4.15.16 field data: "[ESC]WM001F" bleeding into a pending
+  // RM read right after a burst of matrix column writes). Accumulates
+  // rather than overwrites -- if a previous send's estimated drain time
+  // hasn't passed yet, a new send's transmission time queues up behind it,
+  // approximating how the actual UART TX FIFO drains sends in order.
+  // Non-blocking by construction: this only changes when requestRM()/
+  // requestRB() are willing to start, never stalls loop() itself, so it
+  // cannot introduce the Keyence 100us-pulse jitter a real flush() would.
+  void markTxBusy(size_t frameBytes) {
+    uint32_t txMs = (uint32_t)((frameBytes * 10UL * 1000UL) / (uint32_t)NS12::BAUD) + 5UL;
+    uint32_t now = millis();
+    uint32_t baseline = ((int32_t)(txBusyUntilMs - now) > 0) ? txBusyUntilMs : now;
+    txBusyUntilMs = baseline + txMs;
   }
 
   static void printRawByte(uint8_t value) {
