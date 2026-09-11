@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.9
+// Ref: TGIS-510_cpp_V4_15.10
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -218,6 +218,29 @@
 // that's a faster, more reliable answer than continuing to reason about
 // it without access to the manual.
 //
+// FIELD UPDATE (V4.15.10): actually running the V4.15.9 test -- turned
+// NS12_ENABLE_RM_POLLING to 1 and, deliberately, split the offset into an
+// RM-only constant (NS12::RM_WORD_ADDRESS_OFFSET, set to 16384) instead of
+// applying it to WM as well. WM already gets clean transport-level acks at
+// its current (unoffset) addresses; there's no evidence WM needs this
+// offset, and testing an unverified read-side theory is no reason to risk
+// the one path that already works. Next diagnostics capture with this
+// build tells the story: NS12 RM attempts/success no longer 0 confirms the
+// offset theory (and raises the question of whether WM needs it too, as a
+// separate follow-up); still 100% timeout rules it out and this reverts to
+// RM_WORD_ADDRESS_OFFSET = 0 pending a new hypothesis.
+//
+// FIELD UPDATE (V4.15.10, second fix): field report -- "'M' shows the test
+// pattern, but it won't go /reset". Root cause: the live display pipeline
+// only ever pushes a fresh composite when a real capture completes
+// (CaptureController::onNewFrame() -> requestDisplayPush(), by design, so
+// the HMI holds a stable QC-confirmation image instead of flickering live
+// video); 'R' only reset CaptureController's internal latch, never touched
+// the HMI itself. So any one-shot diagnostic push ('M's test pattern, or in
+// principle a real QC image) had no way back to blank except waiting for
+// the next real capture. 'R' now also pushes an explicit all-minimum
+// (coldest palette bucket) frame, making it an actual visible reset.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -249,10 +272,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.9"
+#define FW_VERSION_STRING "V4.15.10"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_9.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_10.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -965,15 +988,15 @@ constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 // values back from the HMI (see serviceHmiInputPolling() and
 // hotMeltStartPositionMm/hotMeltEndPositionMm below) -- not just
 // exercising the link for the (currently off) 32x24 auto-fallback.
-// Still OFF by default: RM gets zero response on this PT (117/117 clean
-// timeouts, field report above) -- current top suspect is CX-Designer's
-// Memory Link "Response" setting, documented as OFF in this project's
-// setup notes. If that's the actual switch controlling whether the PT
-// replies to RM at all (not just WM-write acknowledgment), flipping it
-// ON and re-downloading the PT project is the thing to try before
-// re-enabling this. Until RM works, hotMeltStartPositionMm/
+// V4.15.10 FIELD TEST: turned ON (was 0) to test the RM_WORD_ADDRESS_OFFSET
+// hypothesis (see that constant in the NS12 namespace below) -- RM had
+// gotten zero response on this PT (117/117 clean timeouts) with the
+// "Response=OFF" theory ruled out (screenshot confirmed Response is ON).
+// If RM attempts still show 100% timeouts with the offset applied, that
+// rules the offset theory out too and this should go back to 0 pending a
+// new hypothesis. Until RM works, hotMeltStartPositionMm/
 // hotMeltEndPositionMm stay on their PLACEHOLDER fallback values.
-#define NS12_ENABLE_RM_POLLING 0
+#define NS12_ENABLE_RM_POLLING 1
 
 // PLACEHOLDER -- not confirmed against the real CX-Designer project. These
 // must match whatever $W words the HMI's "HotMelt Start Position" and
@@ -1033,13 +1056,22 @@ constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
 // from the available evidence, not confirmed against primary
 // documentation. Do not trust it over an actual test.
 //
-// Set to 16384 to test: does RM finally get ANY response reading, e.g.,
-// $W10 at wire address 10+16384=16394 instead of plain 10? Requires also
-// setting NS12_ENABLE_RM_POLLING to 1 below so a request actually goes
-// out. Applied once, centrally, here -- every $Wn address elsewhere in
+// RM-only, deliberately NOT applied to WM (see sendWM): WM writes already
+// get transport-level acks with plain (unoffset) addresses -- there is no
+// evidence WM needs this offset, and applying an unverified offset to the
+// one path that already "works" would risk breaking known-good telemetry/
+// matrix traffic just to test a read-side hypothesis. If this offset turns
+// out to be real and WM also needs it, that's a separate, deliberate change
+// once RM confirms the theory -- not bundled in here.
+//
+// V4.15.10 FIELD TEST: set to 16384 (was 0) together with
+// NS12_ENABLE_RM_POLLING=1 below, to test whether RM finally gets ANY
+// response reading, e.g., $W11 at wire address 11+16384=16395 instead of
+// plain 11. Applied once, centrally, here -- every $Wn address elsewhere in
 // this file stays written as its plain CX-Designer label; only the wire-
-// encoded value changes. Default 0 keeps current (unchanged) behavior.
-constexpr uint16_t WORD_ADDRESS_OFFSET = 0;
+// encoded value changes. Revert to 0 if this does not fix RM (rules the
+// theory out) or WM needs its own copy of it if it does.
+constexpr uint16_t RM_WORD_ADDRESS_OFFSET = 16384;
 } // namespace NS12
 
 class NS12Manager {
@@ -1066,9 +1098,10 @@ public:
     frame[n++] = 'W';
     frame[n++] = 'M';
     frame[n++] = '0';
-    // See NS12::WORD_ADDRESS_OFFSET -- 0 by default, so this is a no-op
-    // unless that's being tested.
-    n += writeHex4(&frame[n], (uint16_t)(startAddr + NS12::WORD_ADDRESS_OFFSET));
+    // WM intentionally uses the plain, unoffset address -- see the
+    // RM_WORD_ADDRESS_OFFSET comment in the NS12 namespace for why this
+    // stays decoupled from the RM-side offset test.
+    n += writeHex4(&frame[n], startAddr);
     n += writeDecimal2(&frame[n], (uint8_t)count);
     for (uint16_t i = 0; i < count; i++) {
       if (i > 0) frame[n++] = ',';
@@ -1103,12 +1136,11 @@ public:
   bool requestRM(uint16_t startAddr, uint8_t count) {
     if (readPending || count == 0 || count > 32) return false;
 
-    // See NS12::WORD_ADDRESS_OFFSET -- 0 by default, so this is a no-op
-    // unless that's being tested. wireAddr (not the caller's plain
-    // startAddr) is what's actually sent AND what the response is
-    // validated against below, since the PT would echo back whatever
-    // address it actually processed.
-    uint16_t wireAddr = (uint16_t)(startAddr + NS12::WORD_ADDRESS_OFFSET);
+    // See NS12::RM_WORD_ADDRESS_OFFSET -- currently 16384 under field test.
+    // wireAddr (not the caller's plain startAddr) is what's actually sent
+    // AND what the response is validated against below, since the PT would
+    // echo back whatever address it actually processed.
+    uint16_t wireAddr = (uint16_t)(startAddr + NS12::RM_WORD_ADDRESS_OFFSET);
 
     char frame[16];
     size_t n = 0;
@@ -1179,12 +1211,12 @@ public:
   // successful RM read, then clears until the next one lands. Written by
   // parseRmResponse() on success; consumed by serviceHmiInputPolling().
   // addrOut is translated back to the caller's plain $Wn label (WIRE
-  // address minus NS12::WORD_ADDRESS_OFFSET) -- the offset, if any, stays
-  // entirely internal to this class; external code never has to think
-  // about it, in either direction.
+  // address minus NS12::RM_WORD_ADDRESS_OFFSET) -- the offset, if any,
+  // stays entirely internal to this class; external code never has to
+  // think about it, in either direction.
   bool consumeReadWord(uint16_t &addrOut, uint16_t &valueOut) {
     if (!lastReadValid) return false;
-    addrOut = (uint16_t)(lastReadAddrValue - NS12::WORD_ADDRESS_OFFSET);
+    addrOut = (uint16_t)(lastReadAddrValue - NS12::RM_WORD_ADDRESS_OFFSET);
     valueOut = lastReadWordValue;
     lastReadValid = false;
     return true;
@@ -1835,12 +1867,13 @@ void handlePresenceEdge() {
 // HMI input polling -- rotates a low-rate RM read between the two
 // operator-entered position words (HOTMELT_START_POSITION_ADDR,
 // HOTMELT_END_POSITION_ADDR) and routes any successful result into
-// hotMeltStartPositionMm/hotMeltEndPositionMm. Entirely inert while
-// NS12_ENABLE_RM_POLLING is 0 (the default -- RM gets zero response from
-// this PT right now, see the NS12 namespace field-report comment): no
-// request ever goes out, so the fallback PLACEHOLDER values above stay in
-// effect and hotMeltPositionsFromHmi stays false. Safe to call
-// unconditionally from loop() either way.
+// hotMeltStartPositionMm/hotMeltEndPositionMm. Entirely inert whenever
+// NS12_ENABLE_RM_POLLING is 0: no request ever goes out, so the fallback
+// PLACEHOLDER values above stay in effect and hotMeltPositionsFromHmi
+// stays false. V4.15.10: turned ON to field-test RM_WORD_ADDRESS_OFFSET
+// (see the NS12 namespace) -- if RM still times out 100% with the offset
+// applied, that rules the offset theory out and this should go back to 0.
+// Safe to call unconditionally from loop() either way.
 // =====================================================================
 #if NS12_ENABLE_RM_POLLING
 uint32_t lastHmiPollMs = 0;
@@ -1967,12 +2000,14 @@ void printDiagnostics() {
 // Serial diagnostic commands:
 //   S/W/I/G/F  -- force state (bench test)
 //   1-6        -- toggle MCP outputs
-//   M          -- diagnostic test pattern / one-shot matrix push
+//   M          -- diagnostic test pattern / one-shot matrix push (send 'R'
+//                 to clear it -- the live pipeline won't overwrite it until
+//                 the next real capture completes)
 //   C          -- force capture rearm
 //   B          -- capture per-pixel raw baseline (needed before raw-delta
 //                 acquisition produces meaningful values -- run at idle)
 //   X          -- frame dump: raw-delta (live) vs one-off calibrated C
-//   R          -- rearm/clear latch
+//   R          -- rearm capture latch AND clear the HMI display to blank
 //   D          -- print diagnostics immediately
 // =====================================================================
 void handleSerialCommand(char c) {
@@ -1997,7 +2032,7 @@ void handleSerialCommand(char c) {
                            ((float)i / (StripZone::COLS * StripZone::ROWS));
     }
     pushWordLampMatrix(testPattern);
-    Serial.println(F("[DIAG] Test pattern pushed."));
+    Serial.println(F("[DIAG] Test pattern pushed. Send 'R' to clear it."));
     break;
   }
   case 'C':
@@ -2032,10 +2067,24 @@ void handleSerialCommand(char c) {
     }
     break;
   }
-  case 'R':
+  case 'R': {
     capture.rearm();
-    Serial.println(F("[DIAG] Rearmed."));
+    // V4.15.10 FIELD FIX: rearm alone only reset CaptureController's latch
+    // state, never the HMI display itself -- since the live pipeline only
+    // pushes a new composite when a real capture completes (by design, so
+    // the HMI holds a *stable* QC-confirmation image rather than flickering
+    // live video), a one-shot diagnostic push like 'M's test pattern had no
+    // path back to a blank screen; 'R' looked like it did nothing. Push an
+    // explicit all-minimum (coldest palette bucket) frame here so 'R' is
+    // actually a visible reset, not just an internal state change.
+    float blankFrame[StripZone::COLS * StripZone::ROWS];
+    for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
+      blankFrame[i] = MATRIX_RAW_DELTA_MIN;
+    }
+    pushWordLampMatrix(blankFrame);
+    Serial.println(F("[DIAG] Rearmed, display cleared."));
     break;
+  }
   case 'D':
     printDiagnostics();
     break;
