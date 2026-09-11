@@ -298,9 +298,14 @@ void IRAM_ATTR keyenceResultIsr() {
 // Using 0x1C per spec caused every WM write to be silently ignored --
 // already-fixed root cause of an early blank-screen bug.
 //
-// Baud: 38400 is the confirmed-working, current source of truth. (Stale
-// header comments/constants elsewhere may say 9600 or 19200 -- code
-// constants win over comments when they conflict, per project convention.)
+// Baud: 9600, confirmed against the live NS12 Comm. Setting screen
+// (Serial Port A, Memory Link, 9600/8/1/None, Response ON) on the actual
+// unit. An earlier version of this file asserted 38400 was the
+// "confirmed-working" value and warned against changing it back to 9600
+// -- that claim was not backed by hardware and is superseded by this
+// on-device reading. HotMelt_MLX90640_80032_9_8_1.cpp already used 9600
+// independently, with a bench note that 38400 produced ~15% RM read
+// timeouts vs 0 at 9600, which is consistent with this setting.
 //
 // TX=GPIO43, RX=GPIO44, 8N1, via HIN232CP (confirmed -9V/+8V swing).
 //
@@ -312,7 +317,7 @@ void IRAM_ATTR keyenceResultIsr() {
 // =====================================================================
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
-constexpr long BAUD = 38400; // confirmed source of truth -- do not "fix" back to 9600/19200
+constexpr long BAUD = 9600; // confirmed against the live NS12 Comm. Setting screen
 constexpr uint32_t RM_READ_TIMEOUT_MS = 250; // widened from 120ms after heavier matrix traffic delayed replies
 
 // Word Lamp matrix -- default/trusted mode, 16x8 grid at $W700-$W827,

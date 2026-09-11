@@ -57,9 +57,11 @@ pio device monitor
 - `MATRIX_TEMP_MIN_C`/`MAX_C` set to the production range (20–180°C), not
   the 20–40°C bench value.
 - NS12 Memory Link: ESC=0x1B for every command (this PT's confirmed
-  deviation from the Omron manual's 0x1C), 38400 baud, non-blocking WM
-  writes, blocking-flush RM reads with a 250ms timeout, byte-resyncing
-  `pollRead()`.
+  deviation from the Omron manual's 0x1C), 9600 baud (confirmed against
+  the live NS12 Comm. Setting screen; a prior in-code claim that 38400 was
+  "confirmed-working" was not hardware-backed and has been corrected),
+  non-blocking WM writes, blocking-flush RM reads with a 250ms timeout,
+  byte-resyncing `pollRead()`.
 - Word Lamp palette clamped to indices 1–9 (index 0 is blank/off).
 - 16×8 Word Lamp matrix (`$W700`–`$W827`) as the trusted default; the
   32×24 mode is implemented as a genuinely **column-paced** push (one
