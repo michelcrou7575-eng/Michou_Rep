@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.17
+// Ref: TGIS-510_cpp_V4_15.18
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -390,6 +390,22 @@
 // estimate passes -- entirely non-blocking, so it cannot introduce the
 // Keyence 100us-pulse jitter an actual flush() would risk.
 //
+// FIELD UPDATE (V4.15.18): V4.15.17 made no difference -- field report
+// "HMI buttons do not reach ESP", meaning the failure may be upstream of
+// this firmware's NS12 layer entirely (CX-Designer project setting,
+// wiring, or the PT genuinely not answering RB), not something more
+// non-blocking-read tuning can fix. Added a minimal direct-GPIO proof rig
+// (Pins::TEST_GPIO_*, GPIO_BUTTON_PROOF_TEST) -- 2 outputs + 4 inputs,
+// entirely bypassing NS12 -- to isolate "does the ESP32 see a physical
+// button press at all" from "does the NS12 link carry it." Inputs reuse
+// GPIO4/5/6/7 (confirmed OK for now since the real encoder/presence/
+// Keyence sensors those pins belong to are not physically wired yet);
+// GPIO10-13 (no conflict at all) were the first choice but are hard to
+// reach on the actual board. GPIO_BUTTON_PROOF_TEST makes this and the
+// real sensor pin setup in setup() mutually exclusive, since both claim
+// the same 4 pins -- set it back to 0 once this test is done and the real
+// sensors get wired. Not a replacement for the 5 real HMI buttons/lamps.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -421,10 +437,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.17"
+#define FW_VERSION_STRING "V4.15.18"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_17.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_18.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -465,7 +481,39 @@ constexpr uint8_t KEYENCE_TRIGGER_PIN = 6;
 // interrupt replaces the earlier MCP_IN_KEYENCE_RESULT-on-GPB5 design.
 // PLACEHOLDER -- bench-verify against silkscreen, same as above.
 constexpr uint8_t KEYENCE_RESULT_PIN = 7;
+
+// V4.15.18 direct-GPIO proof test, entirely bypassing NS12 RB/WB. Field
+// report: HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG, $B30-$B34 via
+// RB) never registered a real press despite V4.15.12-17's fixes, so the
+// buttons "do not reach ESP" -- meaning the failure may be upstream of
+// this firmware's NS12 layer entirely (a CX-Designer project/Comm setting
+// issue, wiring, or the PT not actually answering RB for real reasons).
+// This is a minimal proof rig -- 2 outputs + 4 inputs, NOT a replacement
+// for the 5 real HMI buttons/lamps -- to isolate "does the ESP32 correctly
+// see a physical button press at all" from "does the NS12 link carry it."
+//
+// Inputs reuse GPIO4/5/6/7 (ENCODER_PULSE_PIN/PRESENCE_SENSOR_PIN/
+// KEYENCE_TRIGGER_PIN/KEYENCE_RESULT_PIN) -- confirmed OK for now since
+// none of those sensors are physically wired yet, but this makes this test
+// mode and the real encoder/presence/Keyence pin setup mutually exclusive
+// (see GPIO_BUTTON_PROOF_TEST below and setup()). GPIO10-13 (clear of
+// everything, no conflict) were the first choice but are hard to reach on
+// the actual board, hence reusing these instead. GPIO3 (an S3 boot-
+// strapping pin) stays avoided either way.
+constexpr uint8_t TEST_GPIO_OUT_1 = 1;
+constexpr uint8_t TEST_GPIO_OUT_2 = 2;
+constexpr uint8_t TEST_GPIO_IN_1 = 4;
+constexpr uint8_t TEST_GPIO_IN_2 = 5;
+constexpr uint8_t TEST_GPIO_IN_3 = 6;
+constexpr uint8_t TEST_GPIO_IN_4 = 7;
 } // namespace Pins
+
+// Set to 1 while bench-testing the direct-GPIO button proof rig above; set
+// back to 0 (and re-wire GPIO4-7 to the real encoder/presence/Keyence
+// sensors) once that testing is done -- the two are mutually exclusive
+// since both claim the same 4 physical pins. See setup() for exactly what
+// this skips.
+#define GPIO_BUTTON_PROOF_TEST 1
 
 // =====================================================================
 // I2C bus (shared: MLX90640 + MCP23017)
@@ -2369,6 +2417,14 @@ uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
 #endif
 
+// V4.15.18 direct-GPIO proof test state -- declared here (ahead of
+// printDiagnostics(), which reports it) for the same reason buttonState[]
+// is; the servicing function (serviceTestGpio()) that updates it is
+// defined later, after printDiagnostics().
+#if GPIO_BUTTON_PROOF_TEST
+bool testGpioInState[4] = {false, false, false, false};
+#endif
+
 void serviceHmiInputPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
@@ -2484,6 +2540,19 @@ void printDiagnostics() {
 #else
   Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
+  // V4.15.18 direct-GPIO proof test -- independent of NS12/RM polling, but
+  // still gated on GPIO_BUTTON_PROOF_TEST since these pins are the real
+  // encoder/presence/Keyence pins when that's 0 (see Pins::TEST_GPIO_*).
+#if GPIO_BUTTON_PROOF_TEST
+  Serial.print(F("GPIO-TEST inputs (IN1-4, GPIO4/5/6/7) : "));
+  for (uint8_t i = 0; i < 4; i++) {
+    Serial.print(testGpioInState[i] ? '1' : '0');
+    Serial.print(i < 3 ? '/' : '\n');
+  }
+  Serial.printf("GPIO-TEST outputs (OUT1=GPIO%u/OUT2=GPIO%u) : %d / %d\n", Pins::TEST_GPIO_OUT_1,
+                Pins::TEST_GPIO_OUT_2, digitalRead(Pins::TEST_GPIO_OUT_1),
+                digitalRead(Pins::TEST_GPIO_OUT_2));
+#endif
   Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
   Serial.printf("HotMelt Start/End position (mm) : %.1f / %.1f (%s)\n",
                 hotMeltStartPositionMm, hotMeltEndPositionMm,
@@ -2581,9 +2650,38 @@ void serviceHmiButtonPolling() {
 }
 
 // =====================================================================
+// V4.15.18 direct-GPIO proof test -- see Pins::TEST_GPIO_* comment. Edge-
+// detects the 4 test inputs and logs presses immediately over Serial,
+// entirely independent of NS12/RB, to prove (or disprove) that the ESP32
+// side of a physical button press works at all before trusting anything
+// further up the NS12 chain. The 2 test outputs are driven only by the
+// '7'/'8' serial commands below -- verify each with a meter/LED on the
+// bench, independent of the inputs. testGpioInState[] itself is declared
+// earlier (ahead of printDiagnostics(), which reports it).
+// =====================================================================
+#if GPIO_BUTTON_PROOF_TEST
+void serviceTestGpio() {
+  const uint8_t pins[4] = {Pins::TEST_GPIO_IN_1, Pins::TEST_GPIO_IN_2, Pins::TEST_GPIO_IN_3,
+                            Pins::TEST_GPIO_IN_4};
+  for (uint8_t i = 0; i < 4; i++) {
+    // INPUT_PULLUP: idle HIGH, pressed pulls LOW -- inverted here so
+    // testGpioInState[i] reads true while pressed, matching the sense of
+    // the real HMI buttonState[] array.
+    bool pressed = (digitalRead(pins[i]) == LOW);
+    if (pressed != testGpioInState[i]) {
+      testGpioInState[i] = pressed;
+      Serial.printf("[GPIO-TEST] IN%u (GPIO%u) %s\n", i + 1, pins[i], pressed ? "PRESSED" : "released");
+    }
+  }
+}
+#endif // GPIO_BUTTON_PROOF_TEST
+
+// =====================================================================
 // Serial diagnostic commands:
 //   S/W/I/G/F  -- force state (bench test)
 //   1-6        -- toggle MCP outputs
+//   7/8        -- toggle TEST_GPIO_OUT_1/2 (V4.15.18 direct-GPIO proof
+//                 test -- verify with a meter/LED, independent of NS12)
 //   M          -- diagnostic test pattern / one-shot matrix push (send 'R'
 //                 to clear it -- the live pipeline won't overwrite it until
 //                 the next real capture completes)
@@ -2598,6 +2696,8 @@ void serviceHmiButtonPolling() {
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
 // below) and dispatch through handleHmiButtonPress() -- TEST and DIAG there
 // call the same pushTestPattern()/printDiagnostics() as 'M' and 'D' here.
+// TEST_GPIO_IN_1..4 above are a separate, NS12-independent proof rig -- a
+// press there logs immediately and is NOT related to the HMI buttons.
 // =====================================================================
 void handleSerialCommand(char c) {
   switch (c) {
@@ -2669,6 +2769,15 @@ void handleSerialCommand(char c) {
   case 'D':
     printDiagnostics();
     break;
+#if GPIO_BUTTON_PROOF_TEST
+  case '7': case '8': {
+    uint8_t pin = (c == '7') ? Pins::TEST_GPIO_OUT_1 : Pins::TEST_GPIO_OUT_2;
+    bool newState = !digitalRead(pin);
+    digitalWrite(pin, newState);
+    Serial.printf("[GPIO-TEST] OUT%c (GPIO%u) -> %s\n", c, pin, newState ? "HIGH" : "LOW");
+    break;
+  }
+#endif
   default:
     break;
   }
@@ -2719,6 +2828,24 @@ void setup() {
 
   ns12.begin();
 
+#if GPIO_BUTTON_PROOF_TEST
+  // V4.15.18 direct-GPIO proof test -- see Pins::TEST_GPIO_* comment. Its
+  // 4 inputs reuse GPIO4/5/6/7, the same physical pins the real encoder/
+  // presence/Keyence setup below would otherwise claim -- mutually
+  // exclusive with that block below, skipped entirely while this is 1.
+  // INPUT_PULLUP assumed (button wired GPIO-to-GND, idle HIGH, pressed
+  // LOW) since that needs no external resistor -- if wired the other way
+  // (button-to-3.3V), flip these to INPUT_PULLDOWN and invert the read in
+  // serviceTestGpio().
+  pinMode(Pins::TEST_GPIO_OUT_1, OUTPUT);
+  pinMode(Pins::TEST_GPIO_OUT_2, OUTPUT);
+  digitalWrite(Pins::TEST_GPIO_OUT_1, LOW);
+  digitalWrite(Pins::TEST_GPIO_OUT_2, LOW);
+  pinMode(Pins::TEST_GPIO_IN_1, INPUT_PULLUP);
+  pinMode(Pins::TEST_GPIO_IN_2, INPUT_PULLUP);
+  pinMode(Pins::TEST_GPIO_IN_3, INPUT_PULLUP);
+  pinMode(Pins::TEST_GPIO_IN_4, INPUT_PULLUP);
+#else
   // PULLDOWN, not bare INPUT (field report: neither sensor is physically
   // wired yet). A floating input on a CHANGE-interrupt pin picks up noise
   // and fires spuriously, driving handlePresenceEdge()/handleKeyenceResult()
@@ -2739,6 +2866,7 @@ void setup() {
 
   keyenceTrigger.begin(Pins::KEYENCE_TRIGGER_PIN);
   encoder.begin(Pins::ENCODER_PULSE_PIN);
+#endif
 
   fpsWindowStartMs = millis();
   lastDiagnosticMs = millis();
@@ -2778,6 +2906,9 @@ void loop() {
   // a poll cycle later than it otherwise would is a fair trade.
   serviceHmiInputPolling();
   serviceHmiButtonPolling();
+#if GPIO_BUTTON_PROOF_TEST
+  serviceTestGpio(); // direct-GPIO proof test, independent of NS12
+#endif
 
   // MCP polled only during Standby/TubeGap, ~20ms cadence -- see the
   // KEYENCE_RESULT_PIN comment for why InspectingTube-critical signals
