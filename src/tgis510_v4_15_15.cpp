@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.14
+// Ref: TGIS-510_cpp_V4_15.15
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -333,6 +333,29 @@
 // V4.15.13 stays in place to keep validating that the 70% of RB reads
 // reported as successful are genuine PT replies.
 //
+// FIELD UPDATE (V4.15.15): the V4.15.14 build ran on real hardware, and the
+// V4.15.13 raw-success dump paid off immediately -- two genuine, address-
+// matched RB replies on real button presses ("ALARM LOG"/"TEST") captured
+// as "004B" and "0037" (0x4B, 0x37), not "0000"/"0001". Both happen to be
+// odd, both correctly corresponded to a real press, so the intended bit
+// lives in the LSB of a word whose other content is unexplained (padding?
+// an unrelated upper byte?) -- consumeReadBit() now checks `value & 1`
+// instead of `value != 0`, which would have misfired on any nonzero-even
+// reply. Separately, RM success crashed to 10/52 (~19%, down from ~91-96%)
+// once 200ms button polling started competing for the shared link -- RB
+// alone made 216 attempts against RM's 52 in the same window. Buttons are
+// occasional/diagnostic; HotMelt Start/End Position feeds real tube-
+// tracking logic, so BUTTON_POLL_INTERVAL_MS went 200ms->750ms and
+// serviceHmiInputPolling() now runs before serviceHmiButtonPolling() each
+// loop() tick (reversed from V4.15.12) so positions get first refusal on
+// the shared read slot. Also newly observed, once, not yet understood:
+// a raw response "[ESC]ER0517" while an RM request was pending -- neither
+// our-own-WM-traffic-shaped (that check requires response[1]=='W') nor a
+// normal 'R','M'/'B' reply. Could be a genuine PT error/status reply
+// (Memory Link protocols often use "ER" for errors) or could be corrupted
+// bytes from another overlapping transmission -- one sample isn't enough
+// to tell, and no code change follows from it yet. Watch for it recurring.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -364,10 +387,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.14"
+#define FW_VERSION_STRING "V4.15.15"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_14.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_15.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1235,13 +1258,18 @@ constexpr uint16_t LAMP_TREND_FULL_ADDR = 42;
 constexpr uint16_t LAMP_TEST_ADDR = 43;
 constexpr uint16_t LAMP_DIAG_ADDR = 44;
 
-// Snappier than RM_POLL_INTERVAL_MS (position words, which change rarely):
-// a human is waiting on visible feedback after pressing a physical button,
-// so this rotates through the 5 buttons much faster. Worst case (every
-// poll times out at RM_READ_TIMEOUT_MS) is still under 1.5s for a full
-// rotation; typical case (most RB calls succeed quickly, as RM already
-// does) is much faster.
-constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 200;
+// CORRECTED (V4.15.15): originally 200ms ("snappier than position
+// polling"). Real hardware showed this badly oversubscribes the shared
+// link -- RM (position reads) crashed from ~91-96% success to 10/52
+// (~19%) once 200ms button polling was added, with RB itself only 58/216
+// (~27%). Buttons are occasional/diagnostic; HotMelt Start/End Position
+// feeds the actual tube-length-learning and Keyence-trigger logic, so
+// position-read reliability matters more than instant button feedback.
+// 750ms full-rotation-worth of spacing per button still catches any real
+// press well within a human's press-and-release window; see also the
+// loop() ordering change (position polling now goes first each tick) for
+// the other half of this fix.
+constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 750;
 } // namespace NS12
 
 class NS12Manager {
@@ -1485,10 +1513,20 @@ public:
   // Bit-read counterpart to consumeReadWord() -- see that method's comment
   // for the shared-slot/lastReadKind rationale. Introduced V4.15.12 for the
   // HMI push-buttons.
+  //
+  // CORRECTED (V4.15.15): a real RB reply's data field is not a plain "0"
+  // or "1" the way parseReadResponse()'s original comment assumed -- real
+  // captures on a pressed button returned "004B" and "0037" (0x4B, 0x37),
+  // not "0001". Both are odd, and both correctly corresponded to a real
+  // press, so the actual bit lives in the LSB of a word that carries other
+  // (unexplained -- possibly padding, possibly an unrelated upper byte)
+  // content. `!= 0` happened to work by coincidence on these two samples
+  // but would misfire on any nonzero-even value; `& 1` extracts the
+  // intended bit regardless of what's in the rest of the word.
   bool consumeReadBit(uint16_t &addrOut, bool &valueOut) {
     if (!lastReadValid || lastReadKind != ReadKind::Bit) return false;
     addrOut = (uint16_t)(lastReadAddrValue - NS12::BIT_ADDRESS_OFFSET);
-    valueOut = (lastReadWordValue != 0);
+    valueOut = (lastReadWordValue & 1) != 0;
     lastReadValid = false;
     return true;
   }
@@ -2645,12 +2683,16 @@ void loop() {
   }
 
   serviceTubePositionTracking();
-  // Buttons before positions: both share the single in-flight RM/RB read
-  // slot, and a human is watching for the button's lamp to react, while
-  // the position words change rarely -- so buttons get first refusal on
-  // the shared slot each tick.
-  serviceHmiButtonPolling();
+  // CORRECTED (V4.15.15): positions before buttons now, reversed from
+  // V4.15.12's original ordering. Both share the single in-flight RM/RB
+  // read slot; buttons going first seemed reasonable (a human is watching
+  // for the lamp to react) but real hardware showed it starved position
+  // reads badly under combined RM+RB+WM+WB traffic (RM success crashed to
+  // ~19% -- see NS12::BUTTON_POLL_INTERVAL_MS's comment). HotMelt Start/
+  // End Position feeds real tube-tracking logic; a button's lamp reacting
+  // a poll cycle later than it otherwise would is a fair trade.
   serviceHmiInputPolling();
+  serviceHmiButtonPolling();
 
   // MCP polled only during Standby/TubeGap, ~20ms cadence -- see the
   // KEYENCE_RESULT_PIN comment for why InspectingTube-critical signals
