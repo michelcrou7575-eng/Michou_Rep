@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.11
+// Ref: TGIS-510_cpp_V4_15.12
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -264,6 +264,33 @@
 // scale assumption (addresses are now confirmed; whether raw HMI counts
 // map 1:1 to mm has not been checked against a physical measurement).
 //
+// FIELD UPDATE (V4.15.12): added NS12 bit-level RB (read)/WB (write)
+// support, extending the existing single-slot non-blocking read state
+// machine (readPending/expectedAddr/etc., previously RM-only) with a
+// pendingCmdType tag so it now routes 'M' (word) and 'B' (bit) responses
+// to separate counters and separate consumeReadWord()/consumeReadBit()
+// pop-once accessors. Used for 5 new HMI push-buttons confirmed from the
+// real Symbol Table ($B30-$B34: SETUP/ALARM LOG/TREND FULL/TEST/DIAG),
+// polled on a faster NS12::BUTTON_POLL_INTERVAL_MS (200ms) than the
+// position words since a human is watching for the lamp to react.
+// TEST/DIAG button presses call the same pushTestPattern()/
+// printDiagnostics() the 'M'/'D' serial commands do (factored
+// pushTestPattern() out for this); SETUP/ALARM LOG/TREND FULL are stub
+// handlers (lamp + log only) since no such subsystem exists yet -- needs a
+// behavior spec before more goes there. Bit addressing uses a new
+// NS12::BIT_ADDRESS_OFFSET (16384, reused from the $W offset's own
+// screenshot, which separately lists "$B: 16384") applied to BOTH RB and
+// WB, unlike the RM/WM split -- there is no already-working $B write to
+// protect here, since WB is brand new. UNTESTED as of this writing: the
+// offset value for $B, and the entire RB/WB wire format (reasoned by
+// analogy to the confirmed WM/RM framing, ESC='W'/'R' + 'B' + '0' + 4-hex
+// addr + 2-dec count + data, but never bench-verified). Also PLACEHOLDER:
+// the 5 lamp addresses ($B40-$B44) -- no "Button Lamp" objects exist in
+// the real Symbol Table yet, so these were picked as the next free block,
+// not confirmed. Expect a follow-up FIELD UPDATE once real hardware
+// exercises this, the same way RM_WORD_ADDRESS_OFFSET went from
+// hypothesis (V4.15.9/10) to confirmed (V4.15.11).
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -295,10 +322,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.11"
+#define FW_VERSION_STRING "V4.15.12"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_11.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_12.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1045,6 +1072,11 @@ constexpr uint32_t RM_POLL_INTERVAL_MS = 1000; // operator input changes rarely 
 // columns), so 99 leaves comfortable margin without being the bug again.
 constexpr uint16_t MAX_WM_WORDS = 99;
 
+// Same LL-field ceiling applied to WB (bit write). Only ever used for 5
+// lamp bits at once (BUTTON_COUNT) in this file, so this is a generous
+// margin, not a tight fit.
+constexpr uint16_t MAX_WB_BITS = 99;
+
 // Spacing between successive column writes in the experimental 32x24 mode.
 //
 // Derived, not guessed: one column WM frame is ESC+'W'+'M'+'0' (4) +
@@ -1111,6 +1143,55 @@ constexpr uint32_t COLUMN_WRITE_INTERVAL_MS =
 // written as its plain CX-Designer label; only the wire-encoded value
 // changes. Do not revert to 0 -- that was the pre-fix, all-timeouts state.
 constexpr uint16_t RM_WORD_ADDRESS_OFFSET = 16384;
+
+// PLACEHOLDER, UNVERIFIED HYPOTHESIS (V4.15.12): CX-Designer's Comm.
+// Setting screen (same screenshot RM_WORD_ADDRESS_OFFSET came from) also
+// lists "Start Communication $B: 16384" -- $B (bit) memory has its own
+// offset field, separate from $W's, that happens to carry the same value
+// in this project. Reused here as the starting hypothesis for both RB
+// (button reads) and WB (lamp writes) since neither has been tested on
+// real hardware yet -- unlike RM_WORD_ADDRESS_OFFSET, there is no already-
+// working $B write to protect by leaving WB unoffset, so both directions
+// get the same treatment. Confirm/revise from the first real RB/WB
+// diagnostics capture, the same way the $W offset was confirmed in
+// V4.15.11.
+constexpr uint16_t BIT_ADDRESS_OFFSET = 16384;
+
+// HMI push-button inputs, confirmed from the real CX-Designer Symbol Table
+// (project 510_HotMel_20260902_1, I/O Comments "SETUP Button" / "ALARM LOG
+// Button" / "TREND FULL Button" / "TEST Button" / "DIAG Button"). ESP32
+// only ever reads these via RB -- never writes them back, since the touch
+// panel itself owns setting/clearing its own switch bit; writing to it
+// would fight the panel's own control of it.
+constexpr uint16_t BUTTON_SETUP_ADDR = 30;
+constexpr uint16_t BUTTON_ALARM_LOG_ADDR = 31;
+constexpr uint16_t BUTTON_TREND_FULL_ADDR = 32;
+constexpr uint16_t BUTTON_TEST_ADDR = 33;
+constexpr uint16_t BUTTON_DIAG_ADDR = 34;
+constexpr uint8_t BUTTON_COUNT = 5;
+
+// PLACEHOLDER (V4.15.12) -- no "Button Lamp" objects exist in the real
+// Symbol Table yet, so these addresses are picked, not confirmed: the next
+// free $B block after the buttons themselves ($B30-$B34) and well clear of
+// the next known-used bit further down the table ($B870). Confirm/correct
+// against the real CX-Designer project once lamp objects are added there,
+// the same way HOTMELT_START/END_POSITION_ADDR went from placeholder to
+// confirmed in V4.15.11. Contiguous and in the same SETUP/ALARM LOG/
+// TREND FULL/TEST/DIAG order as the buttons above so sendWB() can push all
+// 5 lamp states in one write.
+constexpr uint16_t LAMP_SETUP_ADDR = 40;
+constexpr uint16_t LAMP_ALARM_LOG_ADDR = 41;
+constexpr uint16_t LAMP_TREND_FULL_ADDR = 42;
+constexpr uint16_t LAMP_TEST_ADDR = 43;
+constexpr uint16_t LAMP_DIAG_ADDR = 44;
+
+// Snappier than RM_POLL_INTERVAL_MS (position words, which change rarely):
+// a human is waiting on visible feedback after pressing a physical button,
+// so this rotates through the 5 buttons much faster. Worst case (every
+// poll times out at RM_READ_TIMEOUT_MS) is still under 1.5s for a full
+// rotation; typical case (most RB calls succeed quickly, as RM already
+// does) is much faster.
+constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 200;
 } // namespace NS12
 
 class NS12Manager {
@@ -1209,11 +1290,97 @@ public:
     Serial2.flush(); // request frame is <=11 bytes -- flush cost here is negligible
 
     readPending = true;
+    pendingCmdType = 'M';
     readSentMs = millis();
     readLineUsed = 0;
     expectedAddr = wireAddr; // matched against the response's own address field, which is the wire address
     expectedCount = count;
     return true;
+  }
+
+  // RB: request `count` bits (max 32) starting at `startAddr`. Same non-
+  // blocking shape as requestRM() -- shares the single read-pending state
+  // machine (only one request, word or bit, can ever be in flight), routed
+  // by pendingCmdType so the response validates against 'B' instead of 'M'
+  // and completion counts into the separate rb* counters. Introduced
+  // V4.15.12 for the HMI push-buttons ($B30-$B34) -- see
+  // NS12::BIT_ADDRESS_OFFSET for the address-offset rationale.
+  bool requestRB(uint16_t startAddr, uint8_t count) {
+    if (readPending || count == 0 || count > 32) return false;
+
+    uint16_t wireAddr = (uint16_t)(startAddr + NS12::BIT_ADDRESS_OFFSET);
+
+    char frame[16];
+    size_t n = 0;
+    frame[n++] = (char)NS12::ESC;
+    frame[n++] = 'R';
+    frame[n++] = 'B';
+    frame[n++] = '0';
+    n += writeHex4(&frame[n], wireAddr);
+    n += writeDecimal2(&frame[n], count);
+    frame[n++] = '\r';
+
+#if NS12_DEBUG_RAW_RX
+    Serial.print(F("[NS12] TX RB: "));
+    for (size_t i = 0; i < n; i++) printRawByte((uint8_t)frame[i]);
+    Serial.println();
+#endif
+
+    rbAttempts++;
+    clearRxBuffer();
+    size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
+    if (sent != n) {
+      rbWriteFailures++;
+      return false;
+    }
+    Serial2.flush();
+
+    readPending = true;
+    pendingCmdType = 'B';
+    readSentMs = millis();
+    readLineUsed = 0;
+    expectedAddr = wireAddr;
+    expectedCount = count;
+    return true;
+  }
+
+  // WB: write `count` bits starting at `startAddr`. Fire-and-forget, same
+  // shape as sendWM() -- no response expected. Introduced V4.15.12 for the
+  // HMI push-button lamps ($B40-$B44 PLACEHOLDER). Uses
+  // NS12::BIT_ADDRESS_OFFSET (unlike sendWM, which deliberately stays
+  // unoffset) since there is no already-working $B write to protect --
+  // see the offset's own comment in the NS12 namespace.
+  void sendWB(uint16_t startAddr, const bool *bits, uint8_t count) {
+    if (count > NS12::MAX_WB_BITS) {
+      count = NS12::MAX_WB_BITS;
+      wbOversizedCount++;
+    }
+    char frame[4 + 4 + 2 + NS12::MAX_WB_BITS * 2 + 1];
+    size_t n = 0;
+    frame[n++] = (char)NS12::ESC;
+    frame[n++] = 'W';
+    frame[n++] = 'B';
+    frame[n++] = '0';
+    n += writeHex4(&frame[n], (uint16_t)(startAddr + NS12::BIT_ADDRESS_OFFSET));
+    n += writeDecimal2(&frame[n], count);
+    for (uint8_t i = 0; i < count; i++) {
+      if (i > 0) frame[n++] = ',';
+      frame[n++] = bits[i] ? '1' : '0';
+    }
+    frame[n++] = '\r';
+
+#if NS12_DEBUG_RAW_RX
+    Serial.print(F("[NS12] TX WB: "));
+    for (size_t i = 0; i < n; i++) printRawByte((uint8_t)frame[i]);
+    Serial.println();
+#endif
+
+    wbAttempts++;
+    size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
+    if (sent != n) {
+      wbFailures++;
+    }
+    // No blocking flush -- same rationale as sendWM(): never stall the loop.
   }
 
   // Must be called every loop() iteration. Drives the periodic telemetry
@@ -1248,15 +1415,30 @@ public:
 
   // Pop semantics: returns true (once) for the most recently completed
   // successful RM read, then clears until the next one lands. Written by
-  // parseRmResponse() on success; consumed by serviceHmiInputPolling().
-  // addrOut is translated back to the caller's plain $Wn label (WIRE
-  // address minus NS12::RM_WORD_ADDRESS_OFFSET) -- the offset, if any,
-  // stays entirely internal to this class; external code never has to
-  // think about it, in either direction.
+  // parseReadResponse() on success; consumed by serviceHmiInputPolling().
+  // Gated on lastReadKind == Word so this never accidentally consumes a
+  // completed RB (bit) read meant for consumeReadBit() instead -- both
+  // share the same single-slot "last completed read" state since only one
+  // request (word or bit) is ever in flight at a time. addrOut is
+  // translated back to the caller's plain $Wn label (WIRE address minus
+  // NS12::RM_WORD_ADDRESS_OFFSET) -- the offset, if any, stays entirely
+  // internal to this class; external code never has to think about it, in
+  // either direction.
   bool consumeReadWord(uint16_t &addrOut, uint16_t &valueOut) {
-    if (!lastReadValid) return false;
+    if (!lastReadValid || lastReadKind != ReadKind::Word) return false;
     addrOut = (uint16_t)(lastReadAddrValue - NS12::RM_WORD_ADDRESS_OFFSET);
     valueOut = lastReadWordValue;
+    lastReadValid = false;
+    return true;
+  }
+
+  // Bit-read counterpart to consumeReadWord() -- see that method's comment
+  // for the shared-slot/lastReadKind rationale. Introduced V4.15.12 for the
+  // HMI push-buttons.
+  bool consumeReadBit(uint16_t &addrOut, bool &valueOut) {
+    if (!lastReadValid || lastReadKind != ReadKind::Bit) return false;
+    addrOut = (uint16_t)(lastReadAddrValue - NS12::BIT_ADDRESS_OFFSET);
+    valueOut = (lastReadWordValue != 0);
     lastReadValid = false;
     return true;
   }
@@ -1285,6 +1467,14 @@ public:
   uint32_t wmOversizedCountValue() const { return wmOversizedCount; }
   void resetRmStats() { rmAttempts = 0; rmSuccesses = 0; }
 
+  uint32_t rbAttemptCount() const { return rbAttempts; }
+  uint32_t rbSuccessCount() const { return rbSuccesses; }
+  uint32_t rbWriteFailureCount() const { return rbWriteFailures; }
+  uint32_t rbTimeoutCount() const { return rbTimeouts; }
+  uint32_t rbParseErrorCount() const { return rbParseErrors; }
+  uint32_t wbAttemptCount() const { return wbAttempts; }
+  uint32_t wbFailureCount() const { return wbFailures; }
+
   // Exposed so the matrix-push free functions (serviceDisplayThrottle(),
   // serviceMatrixPacing()) can defer a WM write the same way service()
   // defers telemetry -- see the field-report comment on the NS12
@@ -1296,15 +1486,19 @@ private:
   uint32_t lastTelemetryMs = 0;
 
   bool readPending = false;
+  char pendingCmdType = 'M'; // 'M' (RM/word) or 'B' (RB/bit) -- which request is in flight
   uint32_t readSentMs = 0;
   uint16_t expectedAddr = 0;
   uint8_t expectedCount = 0;
   char readLineBuffer[40] = {};
   size_t readLineUsed = 0;
 
-  // Set by parseRmResponse() on a successful parse, popped by
-  // consumeReadWord(). See that method's comment.
+  // Set by parseReadResponse() on a successful parse, popped by
+  // consumeReadWord() or consumeReadBit() depending on lastReadKind -- see
+  // those methods' comments.
+  enum class ReadKind : uint8_t { Word, Bit };
   bool lastReadValid = false;
+  ReadKind lastReadKind = ReadKind::Word;
   uint16_t lastReadAddrValue = 0;
   uint16_t lastReadWordValue = 0;
 
@@ -1316,6 +1510,15 @@ private:
   uint32_t wmAttempts = 0;
   uint32_t wmFailures = 0;
   uint32_t wmOversizedCount = 0;
+
+  uint32_t rbAttempts = 0;
+  uint32_t rbSuccesses = 0;
+  uint32_t rbWriteFailures = 0;
+  uint32_t rbTimeouts = 0;
+  uint32_t rbParseErrors = 0;
+  uint32_t wbAttempts = 0;
+  uint32_t wbFailures = 0;
+  uint32_t wbOversizedCount = 0;
 
   void clearRxBuffer() {
     while (Serial2.available() > 0) Serial2.read();
@@ -1338,23 +1541,31 @@ private:
   // Unconditional (not gated by NS12_DEBUG_RAW_RX) -- a parse failure is
   // exactly the case that needs visibility by default. Cheap: only fires
   // on the low-rate periodic test read, at most once per TEST_READ_INTERVAL_MS.
-  static void dumpRejectedLine(const char *line, size_t len) {
-    Serial.print(F("[NS12] RM parse failed, raw response ("));
+  // Non-static (V4.15.12) so it can check pendingCmdType to name the right
+  // command letter in the diagnostic message below.
+  void dumpRejectedLine(const char *line, size_t len) {
+    Serial.print(F("[NS12] R"));
+    Serial.print(pendingCmdType);
+    Serial.print(F(" parse failed, raw response ("));
     Serial.print(len);
     Serial.print(F(" bytes): "));
     for (size_t i = 0; i < len; i++) {
       printRawByteAlways((uint8_t)line[i]);
     }
     Serial.println();
-    // Flag explicitly rather than making the reader notice: a genuine RM
-    // reply starts 'R','M'. If it starts 'W','M' instead, this isn't a PT
-    // response at all -- it's shaped like one of OUR OWN WM writes, most
-    // likely a loopback/echo or a write that fired while this read was
-    // still pending. See the field-report comment on the NS12 namespace.
-    if (len >= 3 && line[1] == 'W' && line[2] == 'M') {
-      Serial.println(F("[NS12]   ^ starts 'W','M', not 'R','M' -- looks like "
-                        "our own WM traffic, not a genuine RM reply. Check "
-                        "for TX/RX loopback or PT echo."));
+    // Flag explicitly rather than making the reader notice: a genuine reply
+    // starts 'R' followed by the command letter we requested ('M' or 'B').
+    // If it starts 'W' instead, this isn't a PT response at all -- it's
+    // shaped like one of OUR OWN WM/WB writes, most likely a loopback/echo
+    // or a write that fired while this read was still pending. See the
+    // field-report comment on the NS12 namespace.
+    if (len >= 3 && line[1] == 'W' && (line[2] == 'M' || line[2] == 'B')) {
+      Serial.print(F("[NS12]   ^ starts 'W',"));
+      Serial.print(line[2]);
+      Serial.print(F(" -- looks like our own W"));
+      Serial.print(line[2]);
+      Serial.println(F(" traffic, not a genuine reply. Check for TX/RX "
+                        "loopback or PT echo."));
     }
   }
 
@@ -1383,10 +1594,11 @@ private:
 
       if (ch == '\r') {
         readLineBuffer[readLineUsed] = '\0';
-        if (parseRmResponse(readLineBuffer, readLineUsed)) {
-          rmSuccesses++;
+        bool isBit = (pendingCmdType == 'B');
+        if (parseReadResponse(readLineBuffer, readLineUsed)) {
+          if (isBit) rbSuccesses++; else rmSuccesses++;
         } else {
-          rmParseErrors++;
+          if (isBit) rbParseErrors++; else rmParseErrors++;
           dumpRejectedLine(readLineBuffer, readLineUsed);
         }
         readPending = false;
@@ -1399,23 +1611,29 @@ private:
     if (!readPending) return; // completed above
 
     if (readLineUsed >= sizeof(readLineBuffer) - 1) {
-      rmParseErrors++;
+      if (pendingCmdType == 'B') rbParseErrors++; else rmParseErrors++;
       readPending = false;
       return;
     }
 
     if (now - readSentMs > NS12::RM_READ_TIMEOUT_MS) {
-      rmTimeouts++;
+      if (pendingCmdType == 'B') rbTimeouts++; else rmTimeouts++;
       readPending = false;
     }
   }
 
-  // Response framing: ESC 'R' 'M' [maybe '0' echoed] AAAA(4-hex)
-  // LL(2-dec) D,D,... CR. The '0' echo has not been independently
-  // confirmed on this PT, so both candidate offsets are tried; whichever
-  // validates against the address/count actually requested wins.
-  bool parseRmResponse(const char *response, size_t len) {
-    if (len < 9 || (uint8_t)response[0] != NS12::ESC || response[1] != 'R' || response[2] != 'M') {
+  // Response framing: ESC 'R' 'M'/'B' [maybe '0' echoed] AAAA(4-hex)
+  // LL(2-dec) D,D,... CR -- shared by both RM (word) and RB (bit) reads,
+  // distinguished by pendingCmdType (set in requestRM()/requestRB()). The
+  // '0' echo has not been independently confirmed on this PT, so both
+  // candidate offsets are tried; whichever validates against the address/
+  // count actually requested wins. For a bit read the data field is just
+  // "0" or "1", which strtoul(..., 16) parses identically to decimal, so
+  // no separate bit-parsing path is needed. Renamed from parseRmResponse()
+  // (V4.15.12) when RB support was added.
+  bool parseReadResponse(const char *response, size_t len) {
+    if (len < 9 || (uint8_t)response[0] != NS12::ESC || response[1] != 'R' ||
+        response[2] != pendingCmdType) {
       return false;
     }
 
@@ -1445,6 +1663,7 @@ private:
 
       lastReadAddrValue = addr;
       lastReadWordValue = (uint16_t)parsedValue;
+      lastReadKind = (pendingCmdType == 'B') ? ReadKind::Bit : ReadKind::Word;
       lastReadValid = true;
       return true;
     }
@@ -1609,6 +1828,19 @@ void pushWordLampMatrix(const float *compositeFrame) {
   pendingMatrix.nextCol = 0;
   pendingMatrix.lastWriteMs = 0; // fire the first column on the next service() tick
   pendingMatrix.active = true;
+}
+
+// Shared by the 'M' serial command and the HMI TEST button (V4.15.12) --
+// factored out so both trigger the exact same diagnostic pattern instead of
+// two copies drifting apart.
+void pushTestPattern() {
+  float testPattern[StripZone::COLS * StripZone::ROWS];
+  for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
+    testPattern[i] = MATRIX_RAW_DELTA_MIN + (MATRIX_RAW_DELTA_MAX - MATRIX_RAW_DELTA_MIN) *
+                                                 ((float)i / (StripZone::COLS * StripZone::ROWS));
+  }
+  pushWordLampMatrix(testPattern);
+  Serial.println(F("[DIAG] Test pattern pushed. Send 'R' to clear it."));
 }
 
 // Called every loop() iteration; flushes a queued composite once the
@@ -1919,6 +2151,27 @@ uint32_t lastHmiPollMs = 0;
 uint8_t nextHmiPollIndex = 0;
 #endif
 
+// HMI push-button polling state (V4.15.12). Declared here (ahead of
+// printDiagnostics(), which reports buttonState[]) even though the
+// service function that updates it (serviceHmiButtonPolling(), below
+// printDiagnostics() so it can call printDiagnostics()/pushTestPattern())
+// comes later -- same split as pendingDisplayFrame/displayPushQueued
+// elsewhere in this file.
+#if NS12_ENABLE_RM_POLLING
+constexpr uint16_t kButtonAddrs[NS12::BUTTON_COUNT] = {
+    NS12::BUTTON_SETUP_ADDR, NS12::BUTTON_ALARM_LOG_ADDR, NS12::BUTTON_TREND_FULL_ADDR,
+    NS12::BUTTON_TEST_ADDR, NS12::BUTTON_DIAG_ADDR};
+constexpr uint16_t kLampAddrs[NS12::BUTTON_COUNT] = {
+    NS12::LAMP_SETUP_ADDR, NS12::LAMP_ALARM_LOG_ADDR, NS12::LAMP_TREND_FULL_ADDR,
+    NS12::LAMP_TEST_ADDR, NS12::LAMP_DIAG_ADDR};
+const char *const kButtonNames[NS12::BUTTON_COUNT] = {"SETUP", "ALARM LOG", "TREND FULL", "TEST",
+                                                       "DIAG"};
+bool buttonState[NS12::BUTTON_COUNT] = {};
+uint32_t lastButtonPollMs = 0;
+uint8_t nextButtonPollIndex = 0;
+int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
+#endif
+
 void serviceHmiInputPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
@@ -2020,6 +2273,17 @@ void printDiagnostics() {
                 (unsigned long)ns12.rmAttemptCount(), (unsigned long)ns12.rmSuccessCount(),
                 (unsigned long)ns12.rmWriteFailureCount(), (unsigned long)ns12.rmTimeoutCount(),
                 (unsigned long)ns12.rmParseErrorCount());
+  Serial.printf("NS12 RB attempts/success/writeFail/timeout/parseErr : %lu / %lu / %lu / %lu / %lu\n",
+                (unsigned long)ns12.rbAttemptCount(), (unsigned long)ns12.rbSuccessCount(),
+                (unsigned long)ns12.rbWriteFailureCount(), (unsigned long)ns12.rbTimeoutCount(),
+                (unsigned long)ns12.rbParseErrorCount());
+  Serial.printf("NS12 WB attempts/failures : %lu / %lu\n", (unsigned long)ns12.wbAttemptCount(),
+                (unsigned long)ns12.wbFailureCount());
+  Serial.print(F("HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG) : "));
+  for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
+    Serial.print(buttonState[i] ? '1' : '0');
+    Serial.print(i + 1 < NS12::BUTTON_COUNT ? '/' : '\n');
+  }
 #else
   Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
@@ -2036,6 +2300,81 @@ void printDiagnostics() {
 }
 
 // =====================================================================
+// HMI push-button polling and lamp feedback (V4.15.12). Rotates a fast RB
+// (bit-read) request between the 5 SETUP/ALARM LOG/TREND FULL/TEST/DIAG
+// buttons ($B30-$B34, confirmed from the real Symbol Table) and dispatches
+// a rising-edge (not-pressed -> pressed) to handleHmiButtonPress(). Mirrors
+// serviceHmiInputPolling()'s shape but on its own faster interval
+// (NS12::BUTTON_POLL_INTERVAL_MS) since a human is watching for the lamp
+// to react. Entirely inert whenever NS12_ENABLE_RM_POLLING is 0, same as
+// the position polling above.
+// =====================================================================
+#if NS12_ENABLE_RM_POLLING
+// Lights exactly one lamp (the most recently pressed button) and turns the
+// rest off, in a single WB write across the contiguous LAMP_*_ADDR block.
+// No-op if that button is already the active one -- avoids spamming
+// identical WB traffic every time the same button is polled and found
+// still held down.
+void setActiveLamp(int8_t index) {
+  if (activeLampIndex == index) return;
+  activeLampIndex = index;
+  bool lamps[NS12::BUTTON_COUNT];
+  for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) lamps[i] = ((int8_t)i == index);
+  ns12.sendWB(kLampAddrs[0], lamps, NS12::BUTTON_COUNT);
+}
+
+void handleHmiButtonPress(uint8_t index) {
+  Serial.printf("[HMI] %s button pressed.\n", kButtonNames[index]);
+  setActiveLamp((int8_t)index);
+  switch (index) {
+  case 3: // TEST -- same one-shot pattern as the 'M' serial command
+    pushTestPattern();
+    break;
+  case 4: // DIAG -- same immediate report as the 'D' serial command
+    printDiagnostics();
+    break;
+  default:
+    // SETUP / ALARM LOG / TREND FULL: no subsystem exists yet for these --
+    // no setup-parameter screen, no alarm log, no trend recording. This
+    // stub only lights the lamp and logs the press so the RB/WB plumbing
+    // (button read + lamp write) is fully testable on hardware now. Real
+    // behavior needs a spec -- what SETUP should configure, where the
+    // alarm log lives, what TREND FULL should show -- before more goes
+    // here, same as HotMelt Start/End Position waited on the operator-
+    // entry spec before V4.15.7 built the position-tracking logic.
+    Serial.println(F("[HMI]   ^ stub handler -- no behavior defined yet, see "
+                      "handleHmiButtonPress() comment"));
+    break;
+  }
+}
+#endif
+
+void serviceHmiButtonPolling() {
+#if NS12_ENABLE_RM_POLLING
+  uint32_t now = millis();
+  if (!ns12.isReadPending() && now - lastButtonPollMs >= NS12::BUTTON_POLL_INTERVAL_MS) {
+    lastButtonPollMs = now;
+    ns12.requestRB(kButtonAddrs[nextButtonPollIndex], 1);
+    nextButtonPollIndex = (nextButtonPollIndex + 1) % NS12::BUTTON_COUNT;
+  }
+
+  uint16_t addr;
+  bool pressed;
+  if (ns12.consumeReadBit(addr, pressed)) {
+    for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
+      if (kButtonAddrs[i] != addr) continue;
+      bool wasPressed = buttonState[i];
+      buttonState[i] = pressed;
+      if (pressed && !wasPressed) {
+        handleHmiButtonPress(i);
+      }
+      break;
+    }
+  }
+#endif
+}
+
+// =====================================================================
 // Serial diagnostic commands:
 //   S/W/I/G/F  -- force state (bench test)
 //   1-6        -- toggle MCP outputs
@@ -2048,6 +2387,11 @@ void printDiagnostics() {
 //   X          -- frame dump: raw-delta (live) vs one-off calibrated C
 //   R          -- rearm capture latch AND clear the HMI display to blank
 //   D          -- print diagnostics immediately
+//
+// Separately, the HMI's own SETUP/ALARM LOG/TREND FULL/TEST/DIAG push-
+// buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
+// below) and dispatch through handleHmiButtonPress() -- TEST and DIAG there
+// call the same pushTestPattern()/printDiagnostics() as 'M' and 'D' here.
 // =====================================================================
 void handleSerialCommand(char c) {
   switch (c) {
@@ -2063,17 +2407,9 @@ void handleSerialCommand(char c) {
     }
     break;
   }
-  case 'M': {
-    float testPattern[StripZone::COLS * StripZone::ROWS];
-    for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
-      testPattern[i] = MATRIX_RAW_DELTA_MIN +
-                       (MATRIX_RAW_DELTA_MAX - MATRIX_RAW_DELTA_MIN) *
-                           ((float)i / (StripZone::COLS * StripZone::ROWS));
-    }
-    pushWordLampMatrix(testPattern);
-    Serial.println(F("[DIAG] Test pattern pushed. Send 'R' to clear it."));
+  case 'M':
+    pushTestPattern();
     break;
-  }
   case 'C':
     capture.rearm();
     Serial.println(F("[DIAG] Capture forced/rearmed."));
@@ -2226,6 +2562,11 @@ void loop() {
   }
 
   serviceTubePositionTracking();
+  // Buttons before positions: both share the single in-flight RM/RB read
+  // slot, and a human is watching for the button's lamp to react, while
+  // the position words change rarely -- so buttons get first refusal on
+  // the shared slot each tick.
+  serviceHmiButtonPolling();
   serviceHmiInputPolling();
 
   // MCP polled only during Standby/TubeGap, ~20ms cadence -- see the
