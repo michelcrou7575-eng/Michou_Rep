@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.18
+// Ref: TGIS-510_cpp_V4_15.19
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -406,6 +406,40 @@
 // the same 4 pins -- set it back to 0 once this test is done and the real
 // sensors get wired. Not a replacement for the 5 real HMI buttons/lamps.
 //
+// FIELD UPDATE (V4.15.19): "Hardwired Done - Final" -- a complete,
+// confirmed pin map replacing every remaining PLACEHOLDER pin in this
+// file (both the ESP32-direct Pins namespace and the MCP23017 McpPin
+// namespace). Changes: KEYENCE_TRIGGER_PIN moved GPIO6->GPIO1; new
+// AUXILIARY_TRIGGER_PIN (GPIO2) and AUXILIARY_SPARE_PIN (GPIO6),
+// function TBD, wired for I/O testing only (see serviceIoTest() and the
+// '1'-'9'/'A'/'K' serial commands); KEYENCE_RESULT_PIN (GPIO7) removed
+// entirely -- the field report marks GPIO7 NC, so the direct-GPIO/
+// hardware-interrupt Keyence Result mechanism (keyenceResultIsr()) was
+// removed. Per the user's explicit choice, Keyence Result moves to the
+// MCP23017 (McpPin::INPUT_1 or INPUT_2) -- exact slot not yet decided,
+// and this reopens a previously-documented tradeoff: MCP is only polled
+// during Standby/TubeGap, never InspectingTube, which was the original
+// reason Keyence Result was kept off MCP. Not yet wired into
+// keyenceResultPending/Pass -- see that variable's own comment.
+//
+// GPIO_BUTTON_PROOF_TEST removed entirely (obsolete -- its pins are now
+// all claimed by real, final signals). The old McpPin scheme (NORMAL_STOP/
+// FAST_STOP/HORN/BEACON/READY/WARNING/ACKNOWLEDGE/RESET/AUTO/
+// MACHINE_STOPPED/GLUE_READY) is gone too -- it was a placeholder from
+// before any real MCP23017 wiring existed, and none of those names survive
+// in the real map (2 status RGB LEDs, 1 spare output, 2 generic inputs, 2
+// generic opto outputs). This quietly removed the automatic Standby->
+// WaitingForTube transition and the MCP-driven fault path, since both
+// depended on AUTO/MACHINE_STOPPED inputs that no longer exist --
+// deliberately NOT replaced with a guess at what the 2 real generic MCP
+// inputs should mean; Standby now requires an explicit 'W' command until
+// that's decided. The field report's own literal pin-index values (e.g.
+// "MCP23017_ILED_R = 1" for "GPB0") don't match Adafruit_MCP23X17's actual
+// indexing (GPA0-7=0-7, GPB0-7=8-15, this project's own established
+// convention from the very scheme just removed) -- corrected using the
+// GPA/GPB port+bit each comment names as the source of truth; worth an
+// explicit double-check against the board.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -437,10 +471,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.18"
+#define FW_VERSION_STRING "V4.15.19"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_18.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_19.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -454,66 +488,40 @@ static const uint32_t DIAGNOSTIC_INTERVAL_MS = 1000;
 
 // =====================================================================
 // PIN CONFIG
-// PLACEHOLDER (Action Item 1): none of ENCODER_PULSE_PIN,
-// PRESENCE_SENSOR_PIN, KEYENCE_TRIGGER_PIN, KEYENCE_RESULT_PIN have been
-// bench-verified against the physical board silkscreen. Do not solder
-// against these numbers without checking first.
+// CONFIRMED (V4.15.19): "Hardwired Done - Final" per field report --
+// superseded the old Action Item 1 PLACEHOLDER pins below. See the
+// CONFIRMED comment on the Pins namespace itself for details.
 // =====================================================================
+// CONFIRMED (V4.15.19) -- "Hardwired Done - Final" per field report. This
+// replaces every earlier PLACEHOLDER pin guess in this namespace; real
+// electrical specs given alongside each pin (24V field I/O through 220ohm
+// current-limit resistors on outputs and 10K/1.5K dividers down to 3.2V on
+// inputs) confirm these are opto-isolated real-world connections, not bare
+// GPIO. GPIO0/GPIO3/GPIO7 are S3 boot-strapping pins or explicitly marked
+// NC by the field report -- never use them.
 namespace Pins {
+constexpr uint8_t KEYENCE_TRIGGER_PIN = 1;   // 24V/220ohm OUTPUT, Conn 9
+constexpr uint8_t AUXILIARY_TRIGGER_PIN = 2; // 24V/220ohm OUTPUT, Conn 8 -- function TBD, not yet wired to any logic
+// GPIO3: S3 boot-strapping pin, avoid.
+constexpr uint8_t ENCODER_PULSE_PIN = 4;     // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 7
+constexpr uint8_t PRESENCE_SENSOR_PIN = 5;   // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 6
+constexpr uint8_t AUXILIARY_SPARE_PIN = 6;   // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 5 -- function TBD, not yet wired to any logic
+// GPIO7: field report marks this NC -- Keyence Result no longer lives on a
+// direct ESP32 GPIO. Per the field report, it moves to the MCP23017
+// (McpPin::INPUT_1 or INPUT_2, exact slot not yet decided) -- see the
+// field-report comment above the McpPin namespace for why this reopens a
+// previously-documented latency tradeoff, and keyenceResultPending's own
+// comment for the current (dormant) state of that wiring.
 constexpr uint8_t I2C_SDA = 8;
 constexpr uint8_t I2C_SCL = 9;
-constexpr uint8_t NS12_TX = 43;
-constexpr uint8_t NS12_RX = 44;
+// GPIO10, GPIO11: field report marks these NC.
 
-// Waveshare ESP32-S3-Zero onboard WS2812 RGB LED -- confirmed board
-// feature (not a wiring guess like the placeholders below).
+// Waveshare ESP32-S3-Zero onboard WS2812 RGB LED.
 constexpr uint8_t RGB_LED = 21;
 
-// PLACEHOLDER -- bench-verify against silkscreen (Action Item 1)
-constexpr uint8_t ENCODER_PULSE_PIN = 4;
-constexpr uint8_t PRESENCE_SENSOR_PIN = 5;
-constexpr uint8_t KEYENCE_TRIGGER_PIN = 6;
-
-// Keyence result is intentionally a *direct* ESP32 GPIO, not an MCP23017
-// input. Critical latency finding: MCP23017 is only polled during
-// Standby/TubeGap (~20ms cadence); a signal that must be actionable during
-// InspectingTube cannot ride on that polling. This pin + a hardware
-// interrupt replaces the earlier MCP_IN_KEYENCE_RESULT-on-GPB5 design.
-// PLACEHOLDER -- bench-verify against silkscreen, same as above.
-constexpr uint8_t KEYENCE_RESULT_PIN = 7;
-
-// V4.15.18 direct-GPIO proof test, entirely bypassing NS12 RB/WB. Field
-// report: HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG, $B30-$B34 via
-// RB) never registered a real press despite V4.15.12-17's fixes, so the
-// buttons "do not reach ESP" -- meaning the failure may be upstream of
-// this firmware's NS12 layer entirely (a CX-Designer project/Comm setting
-// issue, wiring, or the PT not actually answering RB for real reasons).
-// This is a minimal proof rig -- 2 outputs + 4 inputs, NOT a replacement
-// for the 5 real HMI buttons/lamps -- to isolate "does the ESP32 correctly
-// see a physical button press at all" from "does the NS12 link carry it."
-//
-// Inputs reuse GPIO4/5/6/7 (ENCODER_PULSE_PIN/PRESENCE_SENSOR_PIN/
-// KEYENCE_TRIGGER_PIN/KEYENCE_RESULT_PIN) -- confirmed OK for now since
-// none of those sensors are physically wired yet, but this makes this test
-// mode and the real encoder/presence/Keyence pin setup mutually exclusive
-// (see GPIO_BUTTON_PROOF_TEST below and setup()). GPIO10-13 (clear of
-// everything, no conflict) were the first choice but are hard to reach on
-// the actual board, hence reusing these instead. GPIO3 (an S3 boot-
-// strapping pin) stays avoided either way.
-constexpr uint8_t TEST_GPIO_OUT_1 = 1;
-constexpr uint8_t TEST_GPIO_OUT_2 = 2;
-constexpr uint8_t TEST_GPIO_IN_1 = 4;
-constexpr uint8_t TEST_GPIO_IN_2 = 5;
-constexpr uint8_t TEST_GPIO_IN_3 = 6;
-constexpr uint8_t TEST_GPIO_IN_4 = 7;
+constexpr uint8_t NS12_TX = 43;
+constexpr uint8_t NS12_RX = 44;
 } // namespace Pins
-
-// Set to 1 while bench-testing the direct-GPIO button proof rig above; set
-// back to 0 (and re-wire GPIO4-7 to the real encoder/presence/Keyence
-// sensors) once that testing is done -- the two are mutually exclusive
-// since both claim the same 4 physical pins. See setup() for exactly what
-// this skips.
-#define GPIO_BUTTON_PROOF_TEST 1
 
 // =====================================================================
 // I2C bus (shared: MLX90640 + MCP23017)
@@ -863,28 +871,42 @@ constexpr uint8_t STRIP2_COL_START = 16, STRIP2_COL_END = 31; // PLACEHOLDER
 // =====================================================================
 // MCP23017 -- machine I/O (stop/interlock), shares the I2C bus.
 // Address 0x20 (A0/A1/A2 grounded).
-// Outputs GPA0-5, Inputs GPB0-4 (active LOW, INPUT_PULLUP).
-// MCP is polled only during Standby/TubeGap, ~20ms cadence -- see the
-// Keyence-result note above for why that matters.
+// MCP is polled only during Standby/TubeGap, ~20ms cadence -- see
+// keyenceResultPending's comment for why that matters now that Keyence
+// Result is slated to live on this chip.
 // =====================================================================
 Adafruit_MCP23X17 mcp;
 static const uint8_t MCP_I2C_ADDR = 0x20;
 static const uint32_t MCP_POLL_INTERVAL_MS = 20;
 
+// CONFIRMED (V4.15.19) -- "Hardwired Done - Final" per field report,
+// replacing the old NORMAL_STOP/FAST_STOP/HORN/BEACON/READY/WARNING/
+// ACKNOWLEDGE/RESET/AUTO/MACHINE_STOPPED/GLUE_READY scheme entirely (that
+// was a placeholder guess from before any real MCP23017 wiring existed;
+// none of those names survive in the real hardware). Adafruit_MCP23X17
+// pin indices: GPA0-7 = 0-7, GPB0-7 = 8-15 -- the field report's own
+// literal constants (1-7, 21-24) don't follow that convention, so these
+// are corrected to match the GPA/GPB port+bit the report's comments name,
+// which is the actual physical fact; the report's raw integers looked
+// like an different, informal numbering (possibly its own connector/
+// channel labels) rather than real Adafruit_MCP23X17 pin arguments.
+// Double-check this correction against the board before trusting it blind.
 namespace McpPin {
-// Outputs (GPA0-5)
-constexpr uint8_t NORMAL_STOP = 0;
-constexpr uint8_t FAST_STOP = 1;
-constexpr uint8_t HORN = 2;
-constexpr uint8_t BEACON = 3;
-constexpr uint8_t READY = 4;
-constexpr uint8_t WARNING = 5;
-// Inputs (GPB0-4), active LOW
-constexpr uint8_t ACKNOWLEDGE = 8;
-constexpr uint8_t RESET = 9;
-constexpr uint8_t AUTO = 10;
-constexpr uint8_t MACHINE_STOPPED = 11;
-constexpr uint8_t GLUE_READY = 12;
+// Internal status RGB LED (enclosure-mounted)
+constexpr uint8_t ILED_R = 8;  // GPB0, OUTPUT
+constexpr uint8_t ILED_G = 9;  // GPB1, OUTPUT
+constexpr uint8_t ILED_B = 10; // GPB2, OUTPUT
+// External status RGB LED (operator-visible)
+constexpr uint8_t ELED_R = 12; // GPB4, OUTPUT
+constexpr uint8_t ELED_G = 13; // GPB5, OUTPUT
+constexpr uint8_t ELED_B = 14; // GPB6, OUTPUT
+constexpr uint8_t SPARE_7 = 15; // GPB7, OUTPUT (3.3V/470ohm) -- function TBD
+// Generic 24V I/O -- function TBD (Keyence Result is slated for one of
+// INPUT_1/INPUT_2 per field report, exact slot not yet decided)
+constexpr uint8_t INPUT_2 = 0; // GPA0, INPUT, Conn 1
+constexpr uint8_t OPTO_2 = 1;  // GPA1, OUTPUT (24V/220ohm), Conn 3
+constexpr uint8_t INPUT_1 = 2; // GPA2, INPUT, Conn 2
+constexpr uint8_t OPTO_1 = 3;  // GPA3, OUTPUT (24V/220ohm), Conn 4
 } // namespace McpPin
 
 bool mcpOk = false;
@@ -898,12 +920,15 @@ bool mcpOk = false;
 class EncoderTracker {
 public:
   void begin(uint8_t pulseGpio) {
-    // PULLDOWN: same reasoning as PRESENCE_SENSOR_PIN/KEYENCE_RESULT_PIN
-    // below -- the encoder isn't physically wired yet (field report), and
-    // pcnt_unit_config() doesn't set a pull resistor on its own, so a
-    // floating pulse line would register phantom counts from noise. The
-    // 100ns glitch filter below only rejects very short noise, not
-    // sustained floating-pin toggling. Low operational impact either way
+    // PULLDOWN: same reasoning as PRESENCE_SENSOR_PIN below. CONFIRMED
+    // (V4.15.19) this pin now carries a real 24V field signal through a
+    // 10K/1.5K divider to 3.2V -- that divider network dominates the
+    // ESP32's own weak (~45k) internal pull, so this is effectively a
+    // no-op now rather than the noise-guard it was for a floating pin;
+    // left in place since it's harmless either way. pcnt_unit_config()
+    // doesn't set a pull resistor on its own. The 100ns glitch filter
+    // below only rejects very short noise, not sustained floating-pin
+    // toggling. Low operational impact either way
     // (encoder.total() is re-zeroed via tubeStartEncoderCount at the start
     // of every real tube cycle) but cheap to make consistent.
     pinMode(pulseGpio, INPUT_PULLDOWN);
@@ -1049,15 +1074,24 @@ private:
 
 KeyenceTrigger keyenceTrigger;
 
-// PLACEHOLDER (Action Item 4): Keyence result pulse polarity not confirmed.
-static const int KEYENCE_RESULT_ACTIVE_LEVEL = HIGH;
+// DORMANT (V4.15.19): Keyence Result used to be a direct ESP32 GPIO
+// (GPIO7) with a hardware interrupt (keyenceResultIsr(), CHANGE-triggered)
+// -- removed because the final hardware map marks GPIO7 NC. Per field
+// report, Keyence Result now lives on the MCP23017 (McpPin::INPUT_1 or
+// INPUT_2), which is only decided in principle, not in which exact slot,
+// and not yet wired into this state -- nothing currently sets
+// keyenceResultPending/keyenceResultPass, so handleKeyenceResult() never
+// fires. This reopens a previously-documented tradeoff: the MCP is only
+// polled during Standby/TubeGap (~20ms cadence), never during
+// InspectingTube, which was the exact reason Keyence Result was kept off
+// MCP originally (a signal that must be actionable mid-tube-pass can't
+// ride on a polling gap that wide). Needs: which INPUT_1/INPUT_2 slot,
+// active level/polarity, and a decision on whether MCP polling itself
+// must now cover InspectingTube too.
+static const int KEYENCE_RESULT_ACTIVE_LEVEL = HIGH; // PLACEHOLDER, not confirmed
 
 volatile bool keyenceResultPending = false;
 volatile bool keyenceResultPass = false;
-void IRAM_ATTR keyenceResultIsr() {
-  keyenceResultPass = digitalRead(Pins::KEYENCE_RESULT_PIN) == KEYENCE_RESULT_ACTIVE_LEVEL;
-  keyenceResultPending = true;
-}
 
 // =====================================================================
 // NS12 HMI / Memory Link protocol
@@ -2288,20 +2322,15 @@ const char *stateName(SystemState s) {
   return "?";
 }
 
-void setMcpOutputs(bool normalStop, bool fastStop, bool horn, bool beacon, bool ready,
-                    bool warning) {
-  if (!mcpOk) return;
-  mcp.digitalWrite(McpPin::NORMAL_STOP, normalStop);
-  mcp.digitalWrite(McpPin::FAST_STOP, fastStop);
-  mcp.digitalWrite(McpPin::HORN, horn);
-  mcp.digitalWrite(McpPin::BEACON, beacon);
-  mcp.digitalWrite(McpPin::READY, ready);
-  mcp.digitalWrite(McpPin::WARNING, warning);
-}
-
+// REMOVED (V4.15.19): setMcpOutputs(normalStop, fastStop, horn, beacon,
+// ready, warning) drove the old NORMAL_STOP/FAST_STOP/HORN/BEACON/READY/
+// WARNING placeholder scheme, which no longer exists in the real hardware
+// map (McpPin::OPTO_1/OPTO_2 are the only real MCP outputs left besides
+// the status LEDs, and their function is not yet decided). enterFaultStop()
+// now only transitions state -- TODO once opto output function is decided:
+// drive whichever of OPTO_1/OPTO_2 (if any) should activate on a fault.
 void enterFaultStop() {
   state = SystemState::FaultStop;
-  setMcpOutputs(true, true, true, true, false, true);
 }
 
 // =====================================================================
@@ -2417,13 +2446,15 @@ uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
 #endif
 
-// V4.15.18 direct-GPIO proof test state -- declared here (ahead of
+// V4.15.19 direct I/O test rig state -- covers the 3 real inputs that
+// don't have dedicated logic elsewhere yet: AUXILIARY_SPARE_PIN (ESP
+// direct) and the 2 generic MCP23017 inputs. Declared here (ahead of
 // printDiagnostics(), which reports it) for the same reason buttonState[]
-// is; the servicing function (serviceTestGpio()) that updates it is
-// defined later, after printDiagnostics().
-#if GPIO_BUTTON_PROOF_TEST
-bool testGpioInState[4] = {false, false, false, false};
-#endif
+// is; the servicing function (serviceIoTest()) that updates it is defined
+// later, after printDiagnostics().
+bool ioTestAuxSpareState = false;
+bool ioTestMcpInputState[2] = {false, false}; // [0]=INPUT_1, [1]=INPUT_2
+uint32_t lastIoTestMcpPollMs = 0;
 
 void serviceHmiInputPolling() {
 #if NS12_ENABLE_RM_POLLING
@@ -2540,19 +2571,14 @@ void printDiagnostics() {
 #else
   Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
-  // V4.15.18 direct-GPIO proof test -- independent of NS12/RM polling, but
-  // still gated on GPIO_BUTTON_PROOF_TEST since these pins are the real
-  // encoder/presence/Keyence pins when that's 0 (see Pins::TEST_GPIO_*).
-#if GPIO_BUTTON_PROOF_TEST
-  Serial.print(F("GPIO-TEST inputs (IN1-4, GPIO4/5/6/7) : "));
-  for (uint8_t i = 0; i < 4; i++) {
-    Serial.print(testGpioInState[i] ? '1' : '0');
-    Serial.print(i < 3 ? '/' : '\n');
-  }
-  Serial.printf("GPIO-TEST outputs (OUT1=GPIO%u/OUT2=GPIO%u) : %d / %d\n", Pins::TEST_GPIO_OUT_1,
-                Pins::TEST_GPIO_OUT_2, digitalRead(Pins::TEST_GPIO_OUT_1),
-                digitalRead(Pins::TEST_GPIO_OUT_2));
-#endif
+  // V4.15.19 direct I/O test rig -- independent of NS12. AUXILIARY_TRIGGER
+  // and the 9 MCP outputs are print-on-demand via their toggle commands'
+  // own Serial output, not repeated here every diagnostics tick.
+  Serial.printf("AUXILIARY_SPARE_PIN (GPIO%u) : %s   AUXILIARY_TRIGGER_PIN (GPIO%u) : %s\n",
+                Pins::AUXILIARY_SPARE_PIN, ioTestAuxSpareState ? "1" : "0",
+                Pins::AUXILIARY_TRIGGER_PIN, digitalRead(Pins::AUXILIARY_TRIGGER_PIN) ? "1" : "0");
+  Serial.printf("MCP INPUT_1/INPUT_2 : %d / %d   (Keyence Result candidate slots, function TBD)\n",
+                ioTestMcpInputState[0], ioTestMcpInputState[1]);
   Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
   Serial.printf("HotMelt Start/End position (mm) : %.1f / %.1f (%s)\n",
                 hotMeltStartPositionMm, hotMeltEndPositionMm,
@@ -2650,38 +2676,56 @@ void serviceHmiButtonPolling() {
 }
 
 // =====================================================================
-// V4.15.18 direct-GPIO proof test -- see Pins::TEST_GPIO_* comment. Edge-
-// detects the 4 test inputs and logs presses immediately over Serial,
-// entirely independent of NS12/RB, to prove (or disprove) that the ESP32
-// side of a physical button press works at all before trusting anything
-// further up the NS12 chain. The 2 test outputs are driven only by the
-// '7'/'8' serial commands below -- verify each with a meter/LED on the
-// bench, independent of the inputs. testGpioInState[] itself is declared
-// earlier (ahead of printDiagnostics(), which reports it).
+// V4.15.19 direct I/O test rig, covering every real pin that doesn't have
+// dedicated logic elsewhere yet: AUXILIARY_SPARE_PIN (ESP direct input)
+// and the 2 generic MCP23017 inputs (candidates for Keyence Result, exact
+// slot TBD). Edge-detects and logs immediately over Serial. The matching
+// outputs (AUXILIARY_TRIGGER_PIN, KEYENCE_TRIGGER_PIN, and the 9 MCP
+// outputs including both status RGB LEDs) are driven only by the serial
+// commands below -- verify each with a meter/LED/scope on the bench.
 // =====================================================================
-#if GPIO_BUTTON_PROOF_TEST
-void serviceTestGpio() {
-  const uint8_t pins[4] = {Pins::TEST_GPIO_IN_1, Pins::TEST_GPIO_IN_2, Pins::TEST_GPIO_IN_3,
-                            Pins::TEST_GPIO_IN_4};
-  for (uint8_t i = 0; i < 4; i++) {
-    // INPUT_PULLUP: idle HIGH, pressed pulls LOW -- inverted here so
-    // testGpioInState[i] reads true while pressed, matching the sense of
-    // the real HMI buttonState[] array.
-    bool pressed = (digitalRead(pins[i]) == LOW);
-    if (pressed != testGpioInState[i]) {
-      testGpioInState[i] = pressed;
-      Serial.printf("[GPIO-TEST] IN%u (GPIO%u) %s\n", i + 1, pins[i], pressed ? "PRESSED" : "released");
+void serviceIoTest() {
+  bool auxPressed = (digitalRead(Pins::AUXILIARY_SPARE_PIN) == HIGH);
+  if (auxPressed != ioTestAuxSpareState) {
+    ioTestAuxSpareState = auxPressed;
+    Serial.printf("[IO-TEST] AUXILIARY_SPARE_PIN (GPIO%u) -> %s\n", Pins::AUXILIARY_SPARE_PIN,
+                  auxPressed ? "HIGH" : "LOW");
+  }
+
+  // MCP inputs: same Standby/TubeGap-only, ~20ms-cadence restriction as
+  // the rest of this file's MCP polling -- an I2C transaction on every
+  // loop() iteration would add latency InspectingTube can't afford.
+  if (mcpOk && (state == SystemState::Standby || state == SystemState::TubeGap)) {
+    uint32_t now = millis();
+    if (now - lastIoTestMcpPollMs >= MCP_POLL_INTERVAL_MS) {
+      lastIoTestMcpPollMs = now;
+      const uint8_t mcpPins[2] = {McpPin::INPUT_1, McpPin::INPUT_2};
+      for (uint8_t i = 0; i < 2; i++) {
+        bool active = (mcp.digitalRead(mcpPins[i]) == LOW); // INPUT_PULLUP: idle HIGH
+        if (active != ioTestMcpInputState[i]) {
+          ioTestMcpInputState[i] = active;
+          Serial.printf("[IO-TEST] MCP INPUT_%u -> %s\n", i + 1, active ? "ACTIVE" : "idle");
+        }
+      }
     }
   }
 }
-#endif // GPIO_BUTTON_PROOF_TEST
 
 // =====================================================================
 // Serial diagnostic commands:
-//   S/W/I/G/F  -- force state (bench test)
-//   1-6        -- toggle MCP outputs
-//   7/8        -- toggle TEST_GPIO_OUT_1/2 (V4.15.18 direct-GPIO proof
-//                 test -- verify with a meter/LED, independent of NS12)
+//   S/W/I/G/F  -- force state (bench test). NOTE (V4.15.19): Standby no
+//                 longer auto-advances to WaitingForTube on its own (the
+//                 old MCP AUTO/MACHINE_STOPPED inputs it depended on don't
+//                 exist in the real hardware map) -- use 'W' explicitly
+//                 until real inputs are assigned to that decision.
+//   1-9        -- toggle MCP outputs, in order: ILED_R, ILED_G, ILED_B,
+//                 ELED_R, ELED_G, ELED_B, SPARE_7, OPTO_1, OPTO_2
+//                 (V4.15.19 real hardware map -- verify each with a
+//                 meter/LED on the bench)
+//   A          -- toggle AUXILIARY_TRIGGER_PIN (ESP GPIO2 direct output,
+//                 function TBD -- verify with a meter/LED)
+//   K          -- manually fire the Keyence trigger pulse (GPIO1) for
+//                 bench-verifying that wiring independent of tube tracking
 //   M          -- diagnostic test pattern / one-shot matrix push (send 'R'
 //                 to clear it -- the live pipeline won't overwrite it until
 //                 the next real capture completes)
@@ -2696,8 +2740,9 @@ void serviceTestGpio() {
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
 // below) and dispatch through handleHmiButtonPress() -- TEST and DIAG there
 // call the same pushTestPattern()/printDiagnostics() as 'M' and 'D' here.
-// TEST_GPIO_IN_1..4 above are a separate, NS12-independent proof rig -- a
-// press there logs immediately and is NOT related to the HMI buttons.
+// AUXILIARY_SPARE_PIN and the 2 MCP inputs (serviceIoTest(), above) are a
+// separate, NS12-independent proof rig -- a change there logs immediately
+// and is NOT related to the HMI buttons.
 // =====================================================================
 void handleSerialCommand(char c) {
   switch (c) {
@@ -2706,13 +2751,30 @@ void handleSerialCommand(char c) {
   case 'I': state = SystemState::InspectingTube; break;
   case 'G': state = SystemState::TubeGap; break;
   case 'F': enterFaultStop(); break;
-  case '1': case '2': case '3': case '4': case '5': case '6': {
+  case '1': case '2': case '3': case '4': case '5':
+  case '6': case '7': case '8': case '9': {
     if (mcpOk) {
-      uint8_t pin = c - '1';
-      mcp.digitalWrite(pin, !mcp.digitalRead(pin));
+      static const uint8_t kMcpOutputPins[9] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B,
+                                                 McpPin::ELED_R, McpPin::ELED_G, McpPin::ELED_B,
+                                                 McpPin::SPARE_7, McpPin::OPTO_1, McpPin::OPTO_2};
+      uint8_t pin = kMcpOutputPins[c - '1'];
+      bool newState = !mcp.digitalRead(pin);
+      mcp.digitalWrite(pin, newState);
+      Serial.printf("[IO-TEST] MCP output #%c (pin %u) -> %s\n", c, pin, newState ? "HIGH" : "LOW");
     }
     break;
   }
+  case 'A': {
+    bool newState = !digitalRead(Pins::AUXILIARY_TRIGGER_PIN);
+    digitalWrite(Pins::AUXILIARY_TRIGGER_PIN, newState);
+    Serial.printf("[IO-TEST] AUXILIARY_TRIGGER_PIN (GPIO%u) -> %s\n", Pins::AUXILIARY_TRIGGER_PIN,
+                  newState ? "HIGH" : "LOW");
+    break;
+  }
+  case 'K':
+    keyenceTrigger.fire();
+    Serial.println(F("[IO-TEST] Keyence trigger pulse fired (GPIO1)."));
+    break;
   case 'M':
     pushTestPattern();
     break;
@@ -2769,15 +2831,6 @@ void handleSerialCommand(char c) {
   case 'D':
     printDiagnostics();
     break;
-#if GPIO_BUTTON_PROOF_TEST
-  case '7': case '8': {
-    uint8_t pin = (c == '7') ? Pins::TEST_GPIO_OUT_1 : Pins::TEST_GPIO_OUT_2;
-    bool newState = !digitalRead(pin);
-    digitalWrite(pin, newState);
-    Serial.printf("[GPIO-TEST] OUT%c (GPIO%u) -> %s\n", c, pin, newState ? "HIGH" : "LOW");
-    break;
-  }
-#endif
   default:
     break;
   }
@@ -2810,12 +2863,13 @@ void setup() {
   mcpOk = mcp.begin_I2C(MCP_I2C_ADDR, &Wire);
   Serial.printf("MCP initialized: %s\n", mcpOk ? "YES" : "NO");
   if (mcpOk) {
-    for (uint8_t p : {McpPin::NORMAL_STOP, McpPin::FAST_STOP, McpPin::HORN,
-                       McpPin::BEACON, McpPin::READY, McpPin::WARNING}) {
+    for (uint8_t p : {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B, McpPin::ELED_R,
+                       McpPin::ELED_G, McpPin::ELED_B, McpPin::SPARE_7, McpPin::OPTO_1,
+                       McpPin::OPTO_2}) {
       mcp.pinMode(p, OUTPUT);
+      mcp.digitalWrite(p, LOW);
     }
-    for (uint8_t p : {McpPin::ACKNOWLEDGE, McpPin::RESET, McpPin::AUTO,
-                       McpPin::MACHINE_STOPPED, McpPin::GLUE_READY}) {
+    for (uint8_t p : {McpPin::INPUT_1, McpPin::INPUT_2}) {
       mcp.pinMode(p, INPUT_PULLUP);
     }
   }
@@ -2828,52 +2882,30 @@ void setup() {
 
   ns12.begin();
 
-#if GPIO_BUTTON_PROOF_TEST
-  // V4.15.18 direct-GPIO proof test -- see Pins::TEST_GPIO_* comment. Its
-  // 4 inputs reuse GPIO4/5/6/7, the same physical pins the real encoder/
-  // presence/Keyence setup below would otherwise claim -- mutually
-  // exclusive with that block below, skipped entirely while this is 1.
-  // INPUT_PULLUP assumed (button wired GPIO-to-GND, idle HIGH, pressed
-  // LOW) since that needs no external resistor -- if wired the other way
-  // (button-to-3.3V), flip these to INPUT_PULLDOWN and invert the read in
-  // serviceTestGpio().
-  pinMode(Pins::TEST_GPIO_OUT_1, OUTPUT);
-  pinMode(Pins::TEST_GPIO_OUT_2, OUTPUT);
-  digitalWrite(Pins::TEST_GPIO_OUT_1, LOW);
-  digitalWrite(Pins::TEST_GPIO_OUT_2, LOW);
-  pinMode(Pins::TEST_GPIO_IN_1, INPUT_PULLUP);
-  pinMode(Pins::TEST_GPIO_IN_2, INPUT_PULLUP);
-  pinMode(Pins::TEST_GPIO_IN_3, INPUT_PULLUP);
-  pinMode(Pins::TEST_GPIO_IN_4, INPUT_PULLUP);
-#else
-  // PULLDOWN, not bare INPUT (field report: neither sensor is physically
-  // wired yet). A floating input on a CHANGE-interrupt pin picks up noise
-  // and fires spuriously, driving handlePresenceEdge()/handleKeyenceResult()
-  // off phantom edges instead of a real sensor -- corrupting bench testing
-  // of every other subsystem in the meantime. PULLDOWN gives both pins a
-  // defined idle LOW, consistent with the code's existing assumptions
-  // (presenceState reads HIGH-active per handlePresenceEdge()'s rising-edge
-  // = "tube entering"; KEYENCE_RESULT_ACTIVE_LEVEL is already HIGH).
-  // PLACEHOLDER like the pins themselves (Action Item 1): revisit once the
-  // real sensors' output types (NPN/PNP/push-pull) are known -- this may
-  // need to become INPUT_PULLUP or no internal pull at all depending on
-  // actual wiring.
+  // PULLDOWN: gives a defined idle LOW consistent with the code's existing
+  // assumption (presenceState reads HIGH-active per handlePresenceEdge()'s
+  // rising-edge = "tube entering"). CONFIRMED (V4.15.19) this pin now
+  // carries a real 24V signal through a 10K/1.5K divider -- see
+  // ENCODER_PULSE_PIN's begin() comment for why that makes the internal
+  // pull practically a no-op rather than a noise-guard now.
   pinMode(Pins::PRESENCE_SENSOR_PIN, INPUT_PULLDOWN);
   attachInterrupt(digitalPinToInterrupt(Pins::PRESENCE_SENSOR_PIN), presenceIsr, CHANGE);
 
-  pinMode(Pins::KEYENCE_RESULT_PIN, INPUT_PULLDOWN);
-  attachInterrupt(digitalPinToInterrupt(Pins::KEYENCE_RESULT_PIN), keyenceResultIsr, CHANGE);
-
   keyenceTrigger.begin(Pins::KEYENCE_TRIGGER_PIN);
   encoder.begin(Pins::ENCODER_PULSE_PIN);
-#endif
+
+  // AUXILIARY_TRIGGER_PIN/AUXILIARY_SPARE_PIN (V4.15.19): confirmed wired,
+  // function not yet assigned. Configured here purely for I/O testing
+  // (serial commands 'A' and diagnostics below) -- no behavior attached.
+  pinMode(Pins::AUXILIARY_TRIGGER_PIN, OUTPUT);
+  digitalWrite(Pins::AUXILIARY_TRIGGER_PIN, LOW);
+  pinMode(Pins::AUXILIARY_SPARE_PIN, INPUT_PULLDOWN);
 
   fpsWindowStartMs = millis();
   lastDiagnosticMs = millis();
 
   if (mcpOk && mlxOk) {
     state = SystemState::Standby;
-    setMcpOutputs(false, false, false, false, true, false);
   } else {
     enterFaultStop();
   }
@@ -2906,24 +2938,27 @@ void loop() {
   // a poll cycle later than it otherwise would is a fair trade.
   serviceHmiInputPolling();
   serviceHmiButtonPolling();
-#if GPIO_BUTTON_PROOF_TEST
-  serviceTestGpio(); // direct-GPIO proof test, independent of NS12
-#endif
+  serviceIoTest(); // V4.15.19 direct I/O test rig -- see its own comment
 
-  // MCP polled only during Standby/TubeGap, ~20ms cadence -- see the
-  // KEYENCE_RESULT_PIN comment for why InspectingTube-critical signals
-  // must not depend on this.
+  // MCP polled only during Standby/TubeGap, ~20ms cadence -- see
+  // keyenceResultPending's comment for why that matters now that Keyence
+  // Result is slated to live here.
+  //
+  // REMOVED (V4.15.19): the old MACHINE_STOPPED/AUTO reads that drove
+  // Standby->WaitingForTube and the machineStopped->enterFaultStop() fault
+  // path -- both pins were part of the placeholder scheme the real
+  // hardware map has no equivalent for. Deliberately NOT replaced with a
+  // guess at which McpPin::INPUT_1/INPUT_2 means "auto" or "stopped" --
+  // that's exactly the kind of safety-relevant assumption this project
+  // shouldn't invent unasked. Standby now requires an explicit 'W' serial
+  // command to advance to WaitingForTube until real inputs are assigned;
+  // there is currently no MCP-driven fault path either. TubeGap's own
+  // advance below is unaffected (never depended on these pins).
   if ((state == SystemState::Standby || state == SystemState::TubeGap) && mcpOk) {
     uint32_t now = millis();
     if (now - lastMcpPollMs >= MCP_POLL_INTERVAL_MS) {
       lastMcpPollMs = now;
-      bool machineStopped = !mcp.digitalRead(McpPin::MACHINE_STOPPED);
-      bool autoMode = !mcp.digitalRead(McpPin::AUTO);
-      if (machineStopped) {
-        enterFaultStop();
-      } else if (state == SystemState::Standby && autoMode) {
-        state = SystemState::WaitingForTube;
-      } else if (state == SystemState::TubeGap) {
+      if (state == SystemState::TubeGap) {
         state = SystemState::WaitingForTube;
         capture.rearm();
       }
