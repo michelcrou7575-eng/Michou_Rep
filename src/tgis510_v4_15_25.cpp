@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.24
+// Ref: TGIS-510_cpp_V4_15.25
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -543,6 +543,29 @@
 // instead of only ever toggling ILED_G, making a recurrence obvious at a
 // glance regardless of which button's bit is misbehaving.
 //
+// FIELD UPDATE (V4.15.25): user confirmed the ALARM LOG phantom "does not
+// come from HMI" -- ruling out a PT-side alarm condition and pointing
+// squarely at this firmware. Real CX-Designer Address View screenshot of
+// the Hot Melt Monitor screen then showed why: "2(P) $W0(W)" at the top --
+// a screen-switch object triggered by writing to $W0. TELEMETRY_BASE_ADDR
+// had been $W0 since this project's first version, meaning telemetry has
+// been writing arbitrary heartbeat/FPS/status values into a page-
+// navigation command word every 250ms the entire time. A strong unifying
+// explanation for multiple previously-separate symptoms: phantom HMI
+// button presses (this firmware's own PLACEHOLDER pin/address guesses
+// were never the issue -- $B33(W)/$B43(R1) in the same screenshot matches
+// BUTTON_TEST_ADDR/LAMP_TEST_ADDR exactly) and unexpected matrix content
+// appearing on 'R' (field report, same session) -- constant bogus page-
+// switch attempts could plausibly corrupt the PT's Memory Link state well
+// beyond visible screen flicker. Moved TELEMETRY_BASE_ADDR to $W100,
+// inside the confirmed-free $W13-$W499 range from the real Symbol Table
+// (V4.15.11). The same screenshot also showed a second screen-switch,
+// "0(P) $W830(W)" -- not currently written by this file, but worth
+// keeping clear of. Root cause not yet proven (needs the fix confirmed on
+// hardware), but this is a much better-evidenced explanation than
+// anything examined so far, and worth testing before chasing anything
+// else.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -574,10 +597,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.24"
+#define FW_VERSION_STRING "V4.15.25"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_24.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_25.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1365,9 +1388,24 @@ constexpr uint8_t PALETTE_MAX_INDEX = 9;
 // per-tube throttle (floor only -- see requestDisplayPush()).
 constexpr uint32_t TARGET_DISPLAY_REFRESH_MS = 2000;
 
-// Telemetry block $W0-$W8 -- operator/PLC visibility into system health.
-// V4.14.0 dropped this entirely; restored from the bench-tested file.
-constexpr uint16_t TELEMETRY_BASE_ADDR = 0;
+// CORRECTED (V4.15.25): moved off $W0. A real CX-Designer Address View
+// screenshot showed "2(P) $W0(W)" at the top of the Hot Melt Monitor
+// screen -- a screen-switch object triggered by writing to $W0. Telemetry
+// had been writing arbitrary heartbeat/FPS/status values into that exact
+// word every TELEMETRY_WRITE_INTERVAL_MS since this project's first
+// version, continuously feeding garbage into what the PT treats as a
+// page-navigation command. This is a strong unifying explanation for
+// multiple previously-unexplained symptoms (phantom HMI button presses
+// that didn't originate from a touch; unexpected matrix content appearing
+// on 'R') -- constant bogus page-switch attempts could plausibly corrupt
+// the PT's Memory Link state in ways that produce stale or wrong replies
+// for extended periods, not just visible screen flicker. Moved to $W100,
+// inside the confirmed-free $W13-$W499 range from the real Symbol Table
+// (V4.15.11) -- still not bench-verified against every object on this
+// specific screen, but clear of every address this project has actually
+// seen used ($W0-$W5, $HW0, $W10, $W500-$W505, $W700+ matrix, $W828/829
+// band, $W830 the other screen-switch this screenshot showed).
+constexpr uint16_t TELEMETRY_BASE_ADDR = 100;
 constexpr uint16_t TELEMETRY_WORD_COUNT = 9;
 constexpr uint32_t TELEMETRY_WRITE_INTERVAL_MS = 250;
 
@@ -2700,8 +2738,9 @@ void handleKeyenceResult() {
 }
 
 // =====================================================================
-// Telemetry helpers -- feed the NS12 $W0-$W8 block every loop (the manager
-// only actually transmits it every NS12::TELEMETRY_WRITE_INTERVAL_MS).
+// Telemetry helpers -- feed the NS12 $W100-$W108 block every loop (the
+// manager only actually transmits it every NS12::TELEMETRY_WRITE_INTERVAL_MS).
+// V4.15.25: moved off $W0-$W8, see TELEMETRY_BASE_ADDR's own comment.
 // =====================================================================
 uint16_t toUnsignedX10(float value) {
   if (!isfinite(value) || value <= 0.0f) return 0;
