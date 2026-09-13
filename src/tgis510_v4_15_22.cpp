@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.21
+// Ref: TGIS-510_cpp_V4_15.22
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -481,6 +481,26 @@
 // real SETUP/ALARM LOG/TREND FULL behavior; this is a bench-test aid, not
 // a step toward one.
 //
+// FIELD UPDATE (V4.15.22): field report on V4.15.21 -- "ILED_G only, no
+// control over it" plus "terminal too fast to read". Two fixes:
+// (1) NS12_DEBUG_RAW_RX turned back OFF -- RM/RB/WM/WB have all sat at
+// 100% success across several diagnostics dumps since V4.15.17-20's fix,
+// so this verbose per-byte trace was only burying other Serial output
+// (like the HMI button/LED messages the user was trying to read) with no
+// remaining diagnostic value. (2) The MCP output toggle (both '1'-'9' and
+// the SETUP/ALARM LOG/TREND FULL LED handlers) used to compute its next
+// state from !mcp.digitalRead(pin) -- reading the MCP23017's GPIO
+// register back and inverting it. That register isn't guaranteed to
+// track the OLAT/output-latch value actually written; "always lights the
+// same channel, never toggles" is exactly what a read-back that returns
+// the same value every time would produce. Added a firmware-side
+// mcpOutputState[9]/toggleMcpOutput() that tracks each of the 9 real MCP
+// outputs' commanded state directly, used by both call sites -- toggling
+// is now deterministic regardless of what the MCP or the physical LED
+// reports back. If ILED_G (or any channel) still won't respond after
+// this, the read-back theory is ruled out and the next suspect is
+// physical wiring on that specific channel.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -512,10 +532,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.21"
+#define FW_VERSION_STRING "V4.15.22"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_21.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_22.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -972,6 +992,28 @@ constexpr uint8_t OPTO_1 = 3;  // GPA3, OUTPUT (24V/220ohm), Conn 4 -- PLC_STATU
 
 bool mcpOk = false;
 
+// V4.15.22: the 9 real MCP outputs, addressable by index 0-8 (matches the
+// '1'-'9' serial command order and, not by coincidence, ILED_R/G/B's own
+// indices 0/1/2, so handleHmiButtonPress()'s SETUP/ALARM LOG/TREND FULL
+// can drive the same array). Firmware tracks each output's own commanded
+// state here rather than reading it back from the MCP23017 to compute a
+// toggle (mcp.digitalRead() on an output pin reads the chip's GPIO
+// register, which is not guaranteed to track the OLAT/output-latch value
+// that was actually written -- field report "ILED_G only, no control"
+// looks exactly like a toggle that reads back the same value every time
+// and never advances). This makes toggling deterministic in firmware
+// regardless of what the MCP or the physical LED reports back.
+constexpr uint8_t kMcpOutputPins[9] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B,
+                                        McpPin::ELED_R, McpPin::ELED_G, McpPin::ELED_B,
+                                        McpPin::SPARE_7, McpPin::OPTO_1, McpPin::OPTO_2};
+bool mcpOutputState[9] = {false, false, false, false, false, false, false, false, false};
+
+void toggleMcpOutput(uint8_t idx) {
+  if (!mcpOk || idx >= 9) return;
+  mcpOutputState[idx] = !mcpOutputState[idx];
+  mcp.digitalWrite(kMcpOutputPins[idx], mcpOutputState[idx]);
+}
+
 // =====================================================================
 // Encoder -- ZATOR LMZ02, single-channel pulse train, no direction.
 // Uses the ESP32 PCNT peripheral. 16-bit HW counter is drained into a
@@ -1209,12 +1251,15 @@ void IRAM_ATTR keyenceResultIsr() {
 // =====================================================================
 
 // Set to 1 for a full TX/RX byte trace on the Serial monitor (verbose --
-// every WM/RM byte). Temporarily ON by default while the mystery above is
-// unresolved -- turn back to 0 once the loopback/interleaving question is
-// settled, since it adds real per-byte overhead and console noise. The RM
+// every WM/RM/RB/WB byte). Turned back OFF (V4.15.22): RM/RB/WM/WB all
+// confirmed 100% success across several diagnostics dumps (V4.15.17-20's
+// deferred-read fix worked) -- the collision-hunting this was on for is
+// done, and it was field-reported as burying other Serial output (HMI
+// button-press/LED-toggle messages) under constant TX-line spam. Flip
+// back to 1 if NS12 traffic needs this level of visibility again. The RM
 // parse-failure dump below is unconditional and separate from this, since
 // that specific failure needs visibility regardless of this flag.
-#define NS12_DEBUG_RAW_RX 1
+#define NS12_DEBUG_RAW_RX 0
 
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
@@ -2728,13 +2773,15 @@ void handleHmiButtonPress(uint8_t index) {
   case 0: // SETUP -> ILED_R
   case 1: // ALARM LOG -> ILED_G
   case 2: { // TREND FULL -> ILED_B
+    // index 0/1/2 line up with kMcpOutputPins' own ILED_R/G/B indices --
+    // see toggleMcpOutput()'s comment for why this tracks firmware state
+    // instead of reading it back from the MCP (V4.15.22 fix for "ILED_G
+    // only, no control" -- a read-back-based toggle could get stuck always
+    // computing the same next state).
     if (mcpOk) {
-      static const uint8_t kIledPins[3] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B};
-      uint8_t pin = kIledPins[index];
-      bool newState = !mcp.digitalRead(pin);
-      mcp.digitalWrite(pin, newState);
+      toggleMcpOutput(index);
       Serial.printf("[HMI]   ^ toggled ILED %s -> %s\n", index == 0 ? "R" : index == 1 ? "G" : "B",
-                    newState ? "ON" : "OFF");
+                    mcpOutputState[index] ? "ON" : "OFF");
     }
     break;
   }
@@ -2846,14 +2893,11 @@ void handleSerialCommand(char c) {
   case 'F': enterFaultStop(); break;
   case '1': case '2': case '3': case '4': case '5':
   case '6': case '7': case '8': case '9': {
+    uint8_t idx = c - '1';
     if (mcpOk) {
-      static const uint8_t kMcpOutputPins[9] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B,
-                                                 McpPin::ELED_R, McpPin::ELED_G, McpPin::ELED_B,
-                                                 McpPin::SPARE_7, McpPin::OPTO_1, McpPin::OPTO_2};
-      uint8_t pin = kMcpOutputPins[c - '1'];
-      bool newState = !mcp.digitalRead(pin);
-      mcp.digitalWrite(pin, newState);
-      Serial.printf("[IO-TEST] MCP output #%c (pin %u) -> %s\n", c, pin, newState ? "HIGH" : "LOW");
+      toggleMcpOutput(idx);
+      Serial.printf("[IO-TEST] MCP output #%c (pin %u) -> %s\n", c, kMcpOutputPins[idx],
+                    mcpOutputState[idx] ? "HIGH" : "LOW");
     }
     break;
   }
