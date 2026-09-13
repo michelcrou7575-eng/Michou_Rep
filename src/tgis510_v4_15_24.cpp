@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.23
+// Ref: TGIS-510_cpp_V4_15.24
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -520,6 +520,29 @@
 // external LEDs are single RGB(+Y for external) LEDs, one color channel
 // lit at a time by design, not 3-4 simultaneous channels mixing colors.
 //
+// FIELD UPDATE (V4.15.24): field report on V4.15.23 -- ILED_G still turns
+// on/off by itself even with the 2-consecutive-read debounce in place.
+// This is an important finding, not just "still broken": a single-sample
+// glitch is exactly what that debounce should catch, so a phantom
+// surviving two confirming polls 750ms apart means the underlying signal
+// reads "pressed" consistently for over a second -- a sustained value,
+// not electrical noise. That points away from a wiring/collision problem
+// and toward $B31 (ALARM LOG) being driven by something in the PT's own
+// logic unrelated to touch -- plausible given its name; worth checking in
+// CX-Designer whether $B31 is referenced anywhere besides that button
+// object (an alarm-summary condition, a macro, etc.), the same way the
+// TEST button's screenshot settled an earlier question. Not yet done --
+// needs the user to check.
+//
+// Separately actioned: "use all Internal and External LEDs". The 3 stub
+// buttons (SETUP/ALARM LOG/TREND FULL) now share one round-robin cycle
+// across all 7 real LED channels (ILED_R/G/B + ELED_R/G/B/Y) instead of
+// each owning one fixed internal channel -- advanceLedCycle(), one
+// channel lit at a time. Incidental benefit: any future phantom press
+// from any of the 3 buttons now visibly advances the same shared LED
+// instead of only ever toggling ILED_G, making a recurrence obvious at a
+// glance regardless of which button's bit is misbehaving.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -551,10 +574,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.23"
+#define FW_VERSION_STRING "V4.15.24"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_23.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_24.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1035,6 +1058,34 @@ void toggleMcpOutput(uint8_t idx) {
   if (!mcpOk || idx >= 9) return;
   mcpOutputState[idx] = !mcpOutputState[idx];
   mcp.digitalWrite(kMcpOutputPins[idx], mcpOutputState[idx]);
+}
+
+// V4.15.24: field request -- exercise all internal AND external LEDs, not
+// just the 3 internal channels. kMcpOutputPins[0..6] are exactly the 7 LED
+// channels (internal R/G/B + external R/G/B/Y, in that order -- see the
+// array's own comment); [7]/[8] are OPTO_1/OPTO_2, not LEDs, so this stops
+// at 7. Shared round-robin, one channel lit at a time (matches the "single
+// RGB(+Y) LED" hardware -- see McpPin::ILED_R's comment): each call turns
+// off whichever channel is currently lit and turns on the next one. All 3
+// stub HMI buttons (SETUP/ALARM LOG/TREND FULL) drive this SAME sequence
+// rather than each owning a fixed channel, so any one of them exercises
+// the full 7-channel set over repeated presses, and -- usefully, while the
+// V4.15.23 phantom-press mitigation is still unresolved -- any phantom
+// firing from ANY of the 3 buttons now visibly advances the same LED
+// instead of only ever toggling ILED_G, making it obvious at a glance
+// whenever it happens again.
+constexpr uint8_t kLedChannelCount = 7;
+int8_t ledCycleActiveIndex = -1; // -1 = none lit yet
+
+void advanceLedCycle() {
+  if (!mcpOk) return;
+  if (ledCycleActiveIndex >= 0) {
+    mcpOutputState[ledCycleActiveIndex] = false;
+    mcp.digitalWrite(kMcpOutputPins[ledCycleActiveIndex], LOW);
+  }
+  ledCycleActiveIndex = (ledCycleActiveIndex + 1) % kLedChannelCount;
+  mcpOutputState[ledCycleActiveIndex] = true;
+  mcp.digitalWrite(kMcpOutputPins[ledCycleActiveIndex], HIGH);
 }
 
 // =====================================================================
@@ -2797,18 +2848,17 @@ void handleHmiButtonPress(uint8_t index) {
   // before more goes here, same as HotMelt Start/End Position waited on
   // the operator-entry spec before V4.15.7 built the position-tracking
   // logic.
-  case 0: // SETUP -> ILED_R
-  case 1: // ALARM LOG -> ILED_G
-  case 2: { // TREND FULL -> ILED_B
-    // index 0/1/2 line up with kMcpOutputPins' own ILED_R/G/B indices --
-    // see toggleMcpOutput()'s comment for why this tracks firmware state
-    // instead of reading it back from the MCP (V4.15.22 fix for "ILED_G
-    // only, no control" -- a read-back-based toggle could get stuck always
-    // computing the same next state).
+  case 0: // SETUP
+  case 1: // ALARM LOG
+  case 2: { // TREND FULL
+    // All 3 share one round-robin LED cycle (all 7 internal+external
+    // channels) rather than each owning a fixed channel -- see
+    // advanceLedCycle()'s comment.
     if (mcpOk) {
-      toggleMcpOutput(index);
-      Serial.printf("[HMI]   ^ toggled ILED %s -> %s\n", index == 0 ? "R" : index == 1 ? "G" : "B",
-                    mcpOutputState[index] ? "ON" : "OFF");
+      advanceLedCycle();
+      static const char *const kChannelNames[7] = {"ILED_R", "ILED_G", "ILED_B", "ELED_R",
+                                                     "ELED_G", "ELED_B", "ELED_Y"};
+      Serial.printf("[HMI]   ^ LED cycle -> %s ON\n", kChannelNames[ledCycleActiveIndex]);
     }
     break;
   }
