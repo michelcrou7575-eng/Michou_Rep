@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.30
+// Ref: TGIS-510_cpp_V4_15.31
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -659,6 +659,30 @@
 // entirely), never the `& 1` bit-position extraction this file spent
 // V4.15.15-27 tuning on data that was never a real bit to begin with.
 //
+// FIELD UPDATE (V4.15.31): got the actual manual (Cat. No. V085-E1-07) --
+// the V4.15.30 word-vs-bit question turned out moot, because the real bug
+// was one level lower, in parseReadResponse() itself, affecting RM and RB
+// alike. The manual documents SUM as *always* appended by the PT to every
+// response ("Be sure that it is added when PT is transmitting"), fully
+// independent of the HOST's own *S=SUM-off setting used in outgoing
+// commands -- this code had only ever considered *S from OUR side, and
+// treated the PT's trailing 2-hex-digit checksum as if it were part of
+// *D. Proof, not another guess: computed SUM (lower byte of the sum of
+// every byte from ESC through *D) for all 5 real RB frames captured in
+// the field (e.g. "RB401F0100" + SUM "4B" for ALARM LOG) and got an exact
+// match against the "4B"/"36"/"4A"/"37"/"38" this code had been reading as
+// the button's value, for every single one. The real *D in all 5 was "00"
+// (OFF) -- every "phantom press" was this code checking the checksum byte,
+// not the button; V4.15.15's `& 1` theory was built on 2 samples that were
+// never real button data at all. The manual's own worked example also
+// shows the true bit lives at bit 7 (MSB) of *D's first byte for a 1-bit
+// read, not bit 0. parseReadResponse() now strips and validates SUM
+// (rejecting a frame whose checksum doesn't match -- a real integrity
+// check this link never had before), and consumeReadBit() now checks
+// 0x80. This is the actual fix, not another diagnostic build -- next real
+// hardware run should show clean 0x00/0x80 button reads and genuine
+// presses finally registering.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -690,10 +714,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.30"
+#define FW_VERSION_STRING "V4.15.31"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_30.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_31.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1959,26 +1983,26 @@ public:
   // for the shared-slot/lastReadKind rationale. Introduced V4.15.12 for the
   // HMI push-buttons.
   //
-  // CORRECTED (V4.15.15): a real RB reply's data field is not a plain "0"
-  // or "1" the way parseReadResponse()'s original comment assumed -- real
-  // captures on a pressed button returned "004B" and "0037" (0x4B, 0x37),
-  // not "0001". Both are odd, and both correctly corresponded to a real
-  // press, so the actual bit lives in the LSB of a word that carries other
-  // (unexplained -- possibly padding, possibly an unrelated upper byte)
-  // content. `!= 0` happened to work by coincidence on these two samples
-  // but would misfire on any nonzero-even value; `& 1` extracts the
-  // intended bit regardless of what's in the rest of the word.
-  // V4.15.27: rawValueOut added -- field data disproved the V4.15.15 bit-0
-  // theory (phantom presses persist on the same 2 buttons regardless of
-  // touch, real touches don't register on any button), so this exposes
-  // the full raw word for a dedicated per-button diagnostic
-  // (serviceHmiButtonPolling()) that logs it directly, rather than
-  // guessing another fixed bit position blind.
+  // SUPERSEDED (V4.15.15's "`& 1`" LSB theory): that fix was derived from
+  // two samples ("004B"/"0037") that were WRONGLY assumed to be the real
+  // data -- they were actually [checksum-included data], and the LSB they
+  // shared was coincidental to the checksum arithmetic, not a real button
+  // bit. See parseReadResponse()'s V4.15.31 header comment for the full
+  // checksum-math proof (verified against all 5 real HMI buttons) that the
+  // PT always appends a trailing 2-hex-digit SUM this code had been
+  // misreading as part of *D. Now that parseReadResponse() strips SUM
+  // before storing lastReadWordValue, that value is genuinely just *D's
+  // real byte content (0x00-0xFF for a 1-bit request). Per the manual's
+  // own worked example ("$B10 11 12 13 14 15 * * -> 10101100 -> AC"), the
+  // FIRST (and, for a 1-bit request, only) requested bit lands at bit 7
+  // (MSB) of that byte, not bit 0 -- bits 6-0 are documented padding
+  // ("fills any of the last 8 bits that does not actually have a valid
+  // read-out data with 0").
   bool consumeReadBit(uint16_t &addrOut, bool &valueOut, uint16_t &rawValueOut) {
     if (!lastReadValid || lastReadKind != ReadKind::Bit) return false;
     addrOut = (uint16_t)(lastReadAddrValue - NS12::RB_BIT_ADDRESS_OFFSET);
     rawValueOut = lastReadWordValue;
-    valueOut = (lastReadWordValue & 1) != 0;
+    valueOut = (lastReadWordValue & 0x80) != 0;
     lastReadValid = false;
     return true;
   }
@@ -2191,14 +2215,32 @@ private:
   }
 
   // Response framing: ESC 'R' 'M'/'B' [maybe '0' echoed] AAAA(4-hex)
-  // LL(2-dec) D,D,... CR -- shared by both RM (word) and RB (bit) reads,
-  // distinguished by pendingCmdType (set in requestRM()/requestRB()). The
-  // '0' echo has not been independently confirmed on this PT, so both
-  // candidate offsets are tried; whichever validates against the address/
-  // count actually requested wins. For a bit read the data field is just
-  // "0" or "1", which strtoul(..., 16) parses identically to decimal, so
-  // no separate bit-parsing path is needed. Renamed from parseRmResponse()
-  // (V4.15.12) when RB support was added.
+  // LL(2-dec) D,D,... SUM(2-hex) CR -- shared by both RM (word) and RB (bit)
+  // reads, distinguished by pendingCmdType (set in requestRM()/requestRB()).
+  // The '0' echo has not been independently confirmed on this PT, so both
+  // candidate offsets are tried; whichever validates wins.
+  //
+  // V4.15.31: SUM added to this comment and this method after getting the
+  // actual manual (Cat. No. V085-E1-07) text. It documents SUM as *always*
+  // appended by the PT to every response ("Be sure that it is added when PT
+  // is transmitting"), independent of whatever *S the HOST used in its own
+  // request -- this code's *S='0' only omits OUR outgoing checksum, never
+  // the PT's. This method had been treating those trailing 2 SUM chars as
+  // part of *D the whole time. Proof, not guesswork: computing SUM (lower
+  // byte of the sum of every byte from ESC through *D) for all 5 real RB
+  // frames captured in the field --
+  //   RB401F01[00]4B (ALARM LOG), RB402001[00]36 (TREND FULL),
+  //   RB401E01[00]4A (SETUP), RB402101[00]37 (TEST), RB402201[00]38 (DIAG)
+  // -- gives 4B/36/4A/37/38 in every single case, an exact match with what
+  // this code had been misreading as "the button's value". The real *D in
+  // all 5 was "00" (OFF) -- every "phantom press" (ALARM LOG/TEST reading
+  // bit0=1) was this code checking a byte that was actually the checksum,
+  // not the button. The manual also documents the true bit-packing (RB:
+  // "Read PT memory ($B)"): *D holds ceil(count/8) bytes, and the FIRST
+  // requested bit lands at bit 7 (MSB) of the first byte, not bit 0 --
+  // worked example: "$B10 11 12 13 14 15 * * -> 1 0 1 0 1 1 0 0 -> AC"
+  // reads $B10 into the leftmost (MSB) position. consumeReadBit() below
+  // now checks bit 0x80, not bit 0x01.
   bool parseReadResponse(const char *response, size_t len) {
     if (len < 9 || (uint8_t)response[0] != NS12::ESC || response[1] != 'R' ||
         response[2] != pendingCmdType) {
@@ -2217,13 +2259,27 @@ private:
       uint8_t count = (uint8_t)strtoul(countText, nullptr, 10);
       if (addr != expectedAddr || count != expectedCount) continue;
 
+      // V4.15.31: the last 2 characters of every response are the PT's own
+      // SUM, not part of *D -- see this method's header comment for the
+      // checksum proof. Reject (try the other offset, then fail) rather
+      // than silently accept if it doesn't validate: this doubles as a
+      // frame-integrity check that would have caught prior link-collision
+      // garbage (e.g. WM/WB echo) structurally satisfying addr/count by
+      // coincidence.
+      size_t totalTailLen = len - headerLen;
+      if (totalTailLen < 3 || totalTailLen - 2 >= 8) continue; // >=1 data char + 2 sum chars
+      size_t dataLen = totalTailLen - 2;
       char dataText[8];
-      size_t dataLen = len - headerLen;
-      if (dataLen == 0 || dataLen >= sizeof(dataText)) continue;
       memcpy(dataText, &response[headerLen], dataLen);
       dataText[dataLen] = '\0';
       char *comma = strchr(dataText, ',');
       if (comma) *comma = '\0';
+
+      char sumText[3] = {response[headerLen + dataLen], response[headerLen + dataLen + 1], '\0'};
+      uint8_t receivedSum = (uint8_t)strtoul(sumText, nullptr, 16);
+      uint8_t computedSum = 0;
+      for (size_t i = 0; i < headerLen + dataLen; i++) computedSum += (uint8_t)response[i];
+      if (computedSum != receivedSum) continue;
 
       char *endPtr = nullptr;
       unsigned long parsedValue = strtoul(dataText, &endPtr, 16);
@@ -2234,35 +2290,29 @@ private:
       lastReadKind = (pendingCmdType == 'B') ? ReadKind::Bit : ReadKind::Word;
       lastReadValid = true;
 
-      // V4.15.28: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
-      // dump for every successful RB parse -- mirrors dumpRejectedLine()'s
+      // V4.15.28/31: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
+      // dump for every successful parse -- mirrors dumpRejectedLine()'s
       // "don't gate the evidence that actually answers the question" policy.
-      // V4.15.27's raw-word diagnostic showed 3 of 4 untouched buttons
-      // returning values that move in lockstep with their own address
-      // ($B32/$B33/$B34 -> raw = address+22 exactly), which a boolean bit
-      // can never do -- so the open question is now about the FRAME ITSELF
-      // (which candidateOffset validated, how wide the data field actually
-      // was) rather than the final parsed integer. This prints exactly
-      // that: the literal addr/count/data text fields as received and the
-      // raw bytes of the whole line, once per successful RB poll (~750ms
-      // cadence across 5 buttons -- not a firehose).
-      if (pendingCmdType == 'B') {
-        Serial.print(F("[NS12-RB-FRAME] offset="));
-        Serial.print(offset);
-        Serial.print(F(" addrText=\""));
-        Serial.print(addrText);
-        Serial.print(F("\" countText=\""));
-        Serial.print(countText);
-        Serial.print(F("\" dataText=\""));
-        Serial.print(dataText);
-        Serial.print(F("\" dataLen="));
-        Serial.print(dataLen);
-        Serial.print(F(" raw ("));
-        Serial.print(len);
-        Serial.print(F(" bytes): "));
-        for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
-        Serial.println();
-      }
+      // Extended to RM too in V4.15.31 (was RB-only) now that SUM-stripping
+      // changes RM's word values as well -- this is the evidence that lets
+      // the next real position read be checked against the fix.
+      Serial.print(F("[NS12-FRAME] R"));
+      Serial.print(pendingCmdType);
+      Serial.print(F(" offset="));
+      Serial.print(offset);
+      Serial.print(F(" addrText=\""));
+      Serial.print(addrText);
+      Serial.print(F("\" countText=\""));
+      Serial.print(countText);
+      Serial.print(F("\" dataText=\""));
+      Serial.print(dataText);
+      Serial.print(F("\" sum=0x"));
+      Serial.print(receivedSum, HEX);
+      Serial.print(F(" (ok) raw ("));
+      Serial.print(len);
+      Serial.print(F(" bytes): "));
+      for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
+      Serial.println();
 #if NS12_DEBUG_RAW_RX
       // V4.15.13: RB successes need the same raw-bytes visibility failures
       // already had (dumpRejectedLine) -- added after real hardware showed
@@ -3123,13 +3173,16 @@ void serviceHmiButtonPolling() {
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != addr) continue;
 
-      // V4.15.27: raw-word diagnostic -- see the NS12Manager::consumeReadBit()
+      // V4.15.27: raw-byte diagnostic -- see the NS12Manager::consumeReadBit()
       // comment. Printed unconditionally (not just on a state change) so a
       // controlled hold/release test has a clean, complete trace to read
-      // back, rather than only the moments this file's own (now-suspect)
-      // `& 1` extraction happened to flip.
-      Serial.printf("[HMI-RAW] %-11s $B%-3u raw=0x%04X bit0=%u\n", kButtonNames[i],
-                    kButtonAddrs[i], rawValue, (unsigned)(rawValue & 1));
+      // back. V4.15.31: now checksum-stripped (rawValue is genuinely just
+      // *D), and bit7 (MSB) is the real button bit per the manual's worked
+      // example -- printed alongside bit0 only so the fix is visible
+      // against prior logs, not because bit0 still means anything.
+      Serial.printf("[HMI-RAW] %-11s $B%-3u raw=0x%02X bit7=%u (bit0=%u)\n", kButtonNames[i],
+                    kButtonAddrs[i], rawValue, (unsigned)((rawValue & 0x80) != 0),
+                    (unsigned)(rawValue & 1));
 
       // V4.15.23: field report -- genuine phantom presses (buttons firing
       // with nobody touching the screen) while RB itself sat at 100%
@@ -3227,7 +3280,7 @@ void servicePlcControl() {
 //   H          -- HMI button burst-probe (V4.15.29): polls all 5 buttons
 //                 back-to-back for BURST_PROBE_DURATION_MS instead of the
 //                 normal 750ms-per-button round-robin, so a held real press
-//                 is guaranteed several [NS12-RB-FRAME]/[HMI-RAW] samples
+//                 is guaranteed several [NS12-FRAME]/[HMI-RAW] samples
 //                 during the touch instead of maybe zero
 //   V          -- word-vs-bit verify walk (V4.15.30): reads $W30..$W34 via
 //                 RM (the independently-confirmed-correct word path) and
@@ -3338,7 +3391,7 @@ void handleSerialCommand(char c) {
   case 'H':
     burstProbeUntilMs = millis() + BURST_PROBE_DURATION_MS;
     Serial.printf("[HMI-PROBE] Burst mode ON for %lu ms -- hold any HMI button NOW, watch for "
-                  "[NS12-RB-FRAME]/[HMI-RAW] lines on its address.\n",
+                  "[NS12-FRAME]/[HMI-RAW] lines on its address.\n",
                   (unsigned long)BURST_PROBE_DURATION_MS);
     break;
 #if NS12_ENABLE_RM_POLLING
