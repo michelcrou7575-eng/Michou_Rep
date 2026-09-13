@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.22
+// Ref: TGIS-510_cpp_V4_15.23
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -501,6 +501,25 @@
 // this, the read-back theory is ruled out and the next suspect is
 // physical wiring on that specific channel.
 //
+// FIELD UPDATE (V4.15.23): the toggle fix above worked (real per-channel
+// LED control confirmed -- "[HMI] TEST button pressed." / "[HMI] ALARM
+// LOG button pressed." / "[HMI] ^ toggled ILED G -> ON" all fired
+// correctly) but surfaced a more serious finding: those presses happened
+// with nobody touching the screen. Genuine phantom presses, not visible
+// noise -- RB had been sitting at 100% success with zero parse errors
+// across hundreds of reads in every recent diagnostics dump, so a wrong
+// address/count match (which would show up as a parse error, not a
+// clean success) is not the explanation. Root cause still unknown.
+// Mitigated, not fixed: serviceHmiButtonPolling() now requires the SAME
+// button to read "pressed" on two CONSECUTIVE polls (pendingButtonRead[])
+// before accepting it and dispatching handleHmiButtonPress() -- a single
+// sample is no longer trusted on its own. Costs up to one extra ~750ms
+// poll cycle of latency for a real press. Also corrected the McpPin
+// naming: what V4.15.19/22 called SPARE_7 is actually ELED_Y, a 4th
+// (yellow) channel on the external status indicator -- both internal and
+// external LEDs are single RGB(+Y for external) LEDs, one color channel
+// lit at a time by design, not 3-4 simultaneous channels mixing colors.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -532,10 +551,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.22"
+#define FW_VERSION_STRING "V4.15.23"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_22.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_23.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -966,15 +985,19 @@ static const uint32_t MCP_POLL_INTERVAL_MS = 20;
 // channel labels) rather than real Adafruit_MCP23X17 pin arguments.
 // Double-check this correction against the board before trusting it blind.
 namespace McpPin {
-// Internal status RGB LED (enclosure-mounted)
+// Internal status LED (enclosure-mounted) -- a single RGB LED, one color
+// channel lit at a time (not 3 simultaneous channels mixing to a blended
+// color).
 constexpr uint8_t ILED_R = 8;  // GPB0, OUTPUT
 constexpr uint8_t ILED_G = 9;  // GPB1, OUTPUT
 constexpr uint8_t ILED_B = 10; // GPB2, OUTPUT
-// External status RGB LED (operator-visible)
+// External status LED (operator-visible) -- single RGB LED (same one-
+// channel-at-a-time convention as internal) PLUS a separate discrete
+// yellow LED, so 4 selectable colors total, not 3.
 constexpr uint8_t ELED_R = 12; // GPB4, OUTPUT
 constexpr uint8_t ELED_G = 13; // GPB5, OUTPUT
 constexpr uint8_t ELED_B = 14; // GPB6, OUTPUT
-constexpr uint8_t SPARE_7 = 15; // GPB7, OUTPUT (3.3V/470ohm) -- function TBD
+constexpr uint8_t ELED_Y = 15; // GPB7, OUTPUT (3.3V/470ohm) -- external yellow LED
 // V4.15.20: the ESP32 is NOT the boss here -- it's an "Auto Triggered
 // Sensor" reporting to a Siemens S7-315-2 PLC, which actually runs the
 // bottomer. These 2 inputs + 2 outputs (plus ESP_OPTO_3, the 3rd status
@@ -1005,7 +1028,7 @@ bool mcpOk = false;
 // regardless of what the MCP or the physical LED reports back.
 constexpr uint8_t kMcpOutputPins[9] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B,
                                         McpPin::ELED_R, McpPin::ELED_G, McpPin::ELED_B,
-                                        McpPin::SPARE_7, McpPin::OPTO_1, McpPin::OPTO_2};
+                                        McpPin::ELED_Y, McpPin::OPTO_1, McpPin::OPTO_2};
 bool mcpOutputState[9] = {false, false, false, false, false, false, false, false, false};
 
 void toggleMcpOutput(uint8_t idx) {
@@ -2541,7 +2564,11 @@ constexpr uint16_t kLampAddrs[NS12::BUTTON_COUNT] = {
     NS12::LAMP_TEST_ADDR, NS12::LAMP_DIAG_ADDR};
 const char *const kButtonNames[NS12::BUTTON_COUNT] = {"SETUP", "ALARM LOG", "TREND FULL", "TEST",
                                                        "DIAG"};
-bool buttonState[NS12::BUTTON_COUNT] = {};
+bool buttonState[NS12::BUTTON_COUNT] = {}; // debounce-confirmed state
+// V4.15.23: most recent single raw RB sample per button, NOT yet
+// confirmed -- see the 2-consecutive-reads debounce in
+// serviceHmiButtonPolling()'s comment for why this exists.
+bool pendingButtonRead[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
@@ -2803,19 +2830,41 @@ void serviceHmiButtonPolling() {
   if (ns12.consumeReadBit(addr, pressed)) {
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != addr) continue;
+
+      // V4.15.23: field report -- genuine phantom presses (buttons firing
+      // with nobody touching the screen) while RB itself sat at 100%
+      // success, zero parse errors, across hundreds of reads. Since RB
+      // wasn't failing (a wrong address+count wouldn't parse as success
+      // at all), a single sample clearly isn't trustworthy enough on its
+      // own -- so a transition into "pressed" is now only accepted once
+      // TWO CONSECUTIVE polls of this same button agree. A disagreement
+      // just updates the pending candidate and waits for the next poll to
+      // confirm one way or the other; it never fires handleHmiButtonPress()
+      // on its own. Costs up to one extra ~750ms poll cycle of detection
+      // latency for a real press -- an acceptable trade for not firing
+      // TEST/DIAG/lamp changes at random. Root cause still unknown (a
+      // genuinely bouncy or misbehaving switch object on the PT side? A
+      // wrong word/bit being addressed after all? -- unresolved), so this
+      // is a mitigation, not a fix.
+      if (pressed != pendingButtonRead[i]) {
+        pendingButtonRead[i] = pressed;
+        break;
+      }
+
       bool wasPressed = buttonState[i];
       buttonState[i] = pressed;
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
         // Acknowledge -- clear the switch's own bit back to 0 (V4.15.14,
         // see BUTTON_SETUP_ADDR's comment). Fire-and-forget like every
-        // other WB; also clear buttonState[i] locally right away rather
-        // than waiting for the bit's next RB poll to confirm the clear
-        // landed, so the very next real press is detected as a fresh edge
-        // without an extra poll-cycle's delay.
+        // other WB; also clear buttonState[i]/pendingButtonRead[i]
+        // locally right away rather than waiting for the bit's next RB
+        // poll to confirm the clear landed, so the very next real press
+        // is detected as a fresh edge without an extra poll-cycle's delay.
         bool clearBit = false;
         ns12.sendWB(kButtonAddrs[i], &clearBit, 1);
         buttonState[i] = false;
+        pendingButtonRead[i] = false;
       }
       break;
     }
@@ -2853,7 +2902,7 @@ void servicePlcControl() {
 //                 exist in the real hardware map) -- use 'W' explicitly
 //                 until real inputs are assigned to that decision.
 //   1-9        -- toggle MCP outputs, in order: ILED_R, ILED_G, ILED_B,
-//                 ELED_R, ELED_G, ELED_B, SPARE_7, OPTO_1, OPTO_2
+//                 ELED_R, ELED_G, ELED_B, ELED_Y, OPTO_1, OPTO_2
 //                 (V4.15.19 real hardware map -- verify each with a
 //                 meter/LED on the bench). NOTE: '8'/'9' are also
 //                 PLC_STATUS bits 0/1 -- a manual toggle here is transient,
@@ -3009,7 +3058,7 @@ void setup() {
   Serial.printf("MCP initialized: %s\n", mcpOk ? "YES" : "NO");
   if (mcpOk) {
     for (uint8_t p : {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B, McpPin::ELED_R,
-                       McpPin::ELED_G, McpPin::ELED_B, McpPin::SPARE_7, McpPin::OPTO_1,
+                       McpPin::ELED_G, McpPin::ELED_B, McpPin::ELED_Y, McpPin::OPTO_1,
                        McpPin::OPTO_2}) {
       mcp.pinMode(p, OUTPUT);
       mcp.digitalWrite(p, LOW);
