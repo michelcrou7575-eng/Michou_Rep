@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.20
+// Ref: TGIS-510_cpp_V4_15.21
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -470,6 +470,17 @@
 // only STOP (FaultStop) and READY (everything else) are automatically
 // driven; use 'P' for the other two until a real condition is defined.
 //
+// FIELD UPDATE (V4.15.21): field request -- a physical, tangible way to
+// confirm an HMI button press actually completes end-to-end (touch -> RB
+// read -> dispatch), without needing to watch Serial. SETUP/ALARM LOG/
+// TREND FULL's stub handlers (log-only until now) each toggle one channel
+// of the internal RGB LED instead: SETUP->ILED_R, ALARM LOG->ILED_G,
+// TREND FULL->ILED_B. Exactly 3 stub buttons and 3 LED channels, so the
+// mapping is a natural 1:1, not yet confirmed as the intended final
+// pairing -- easy to change if a different assignment is wanted. Still no
+// real SETUP/ALARM LOG/TREND FULL behavior; this is a bench-test aid, not
+// a step toward one.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -501,10 +512,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.20"
+#define FW_VERSION_STRING "V4.15.21"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_20.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_21.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2704,18 +2715,29 @@ void handleHmiButtonPress(uint8_t index) {
   case 4: // DIAG -- same immediate report as the 'D' serial command
     printDiagnostics();
     break;
-  default:
-    // SETUP / ALARM LOG / TREND FULL: no subsystem exists yet for these --
-    // no setup-parameter screen, no alarm log, no trend recording. This
-    // stub only lights the lamp and logs the press so the RB/WB plumbing
-    // (button read + lamp write) is fully testable on hardware now. Real
-    // behavior needs a spec -- what SETUP should configure, where the
-    // alarm log lives, what TREND FULL should show -- before more goes
-    // here, same as HotMelt Start/End Position waited on the operator-
-    // entry spec before V4.15.7 built the position-tracking logic.
-    Serial.println(F("[HMI]   ^ stub handler -- no behavior defined yet, see "
-                      "handleHmiButtonPress() comment"));
+  // SETUP / ALARM LOG / TREND FULL: no subsystem exists yet for these --
+  // no setup-parameter screen, no alarm log, no trend recording. V4.15.21:
+  // each toggles one channel of the internal RGB LED (ILED_R/G/B) instead
+  // of just logging -- a tangible, physical end-to-end confirmation (touch
+  // -> RB read -> dispatch -> visible LED change) that doesn't require
+  // watching Serial. Real behavior still needs a spec -- what SETUP should
+  // configure, where the alarm log lives, what TREND FULL should show --
+  // before more goes here, same as HotMelt Start/End Position waited on
+  // the operator-entry spec before V4.15.7 built the position-tracking
+  // logic.
+  case 0: // SETUP -> ILED_R
+  case 1: // ALARM LOG -> ILED_G
+  case 2: { // TREND FULL -> ILED_B
+    if (mcpOk) {
+      static const uint8_t kIledPins[3] = {McpPin::ILED_R, McpPin::ILED_G, McpPin::ILED_B};
+      uint8_t pin = kIledPins[index];
+      bool newState = !mcp.digitalRead(pin);
+      mcp.digitalWrite(pin, newState);
+      Serial.printf("[HMI]   ^ toggled ILED %s -> %s\n", index == 0 ? "R" : index == 1 ? "G" : "B",
+                    newState ? "ON" : "OFF");
+    }
     break;
+  }
   }
 }
 #endif
