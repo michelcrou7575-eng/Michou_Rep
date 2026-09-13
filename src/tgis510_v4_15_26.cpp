@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.25
+// Ref: TGIS-510_cpp_V4_15.26
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -566,6 +566,22 @@
 // anything examined so far, and worth testing before chasing anything
 // else.
 //
+// FIELD UPDATE (V4.15.26): field question -- "never seen 1 ever, are we
+// getting the right address?" on the diagnostics "HMI buttons : 0/0/0/0/0"
+// line. Addressing is already confirmed correct (the V4.15.25 screenshot's
+// $B33(W)/$B43(R1) matches BUTTON_TEST_ADDR/LAMP_TEST_ADDR exactly) --
+// the real explanation is simpler: buttonState[i] is force-cleared back to
+// false inside the SAME call that detects a press (so the next press is a
+// fresh edge without an extra poll-cycle's wait), so the "confirmed
+// pressed" state is only ever true for microseconds. A once-a-second
+// diagnostics snapshot landing in that window is practically impossible --
+// the line reading all-0 forever was never evidence of a broken read.
+// Added buttonPressCount[], a lifetime counter incremented in
+// handleHmiButtonPress(), printed alongside the existing instantaneous
+// line -- this is the actual way to confirm via the periodic diagnostics
+// dump (not just a live Serial line caught at the right instant) that
+// presses are registering.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -597,10 +613,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.25"
+#define FW_VERSION_STRING "V4.15.26"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_25.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_26.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2661,6 +2677,15 @@ bool pendingButtonRead[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
+// V4.15.26: buttonState[] gets force-cleared back to false inside the same
+// call that detects a press (so the very next press is a fresh edge
+// without an extra poll-cycle's delay) -- meaning the "confirmed pressed"
+// state is visible for microseconds and a once-a-second diagnostics
+// snapshot will practically never catch it as "1", by design, not because
+// presses aren't registering. This lifetime counter is the actual way to
+// verify a press was detected via the periodic diagnostics dump, without
+// needing to watch Serial at the exact right moment.
+uint32_t buttonPressCount[NS12::BUTTON_COUNT] = {};
 #endif
 
 // =====================================================================
@@ -2813,9 +2838,18 @@ void printDiagnostics() {
                 (unsigned long)ns12.rbParseErrorCount());
   Serial.printf("NS12 WB attempts/failures : %lu / %lu\n", (unsigned long)ns12.wbAttemptCount(),
                 (unsigned long)ns12.wbFailureCount());
-  Serial.print(F("HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG) : "));
+  Serial.print(F("HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG), instantaneous : "));
   for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
     Serial.print(buttonState[i] ? '1' : '0');
+    Serial.print(i + 1 < NS12::BUTTON_COUNT ? '/' : '\n');
+  }
+  // V4.15.26: the line above will practically always read all-0 -- see
+  // buttonPressCount[]'s own comment for why that's not evidence of a
+  // broken read. This lifetime counter is the real way to confirm presses
+  // are registering via this periodic dump.
+  Serial.print(F("HMI button presses (lifetime)                                  : "));
+  for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
+    Serial.print((unsigned long)buttonPressCount[i]);
     Serial.print(i + 1 < NS12::BUTTON_COUNT ? '/' : '\n');
   }
 #else
@@ -2868,6 +2902,7 @@ void setActiveLamp(int8_t index) {
 }
 
 void handleHmiButtonPress(uint8_t index) {
+  buttonPressCount[index]++;
   Serial.printf("[HMI] %s button pressed.\n", kButtonNames[index]);
   setActiveLamp((int8_t)index);
   switch (index) {
