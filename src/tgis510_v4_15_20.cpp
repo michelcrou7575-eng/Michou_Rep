@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.19
+// Ref: TGIS-510_cpp_V4_15.20
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -410,7 +410,7 @@
 // confirmed pin map replacing every remaining PLACEHOLDER pin in this
 // file (both the ESP32-direct Pins namespace and the MCP23017 McpPin
 // namespace). Changes: KEYENCE_TRIGGER_PIN moved GPIO6->GPIO1; new
-// AUXILIARY_TRIGGER_PIN (GPIO2) and AUXILIARY_SPARE_PIN (GPIO6),
+// ESP_OPTO_3 (GPIO2) and ESP_INPUT_3 (GPIO6),
 // function TBD, wired for I/O testing only (see serviceIoTest() and the
 // '1'-'9'/'A'/'K' serial commands); KEYENCE_RESULT_PIN (GPIO7) removed
 // entirely -- the field report marks GPIO7 NC, so the direct-GPIO/
@@ -439,6 +439,36 @@
 // convention from the very scheme just removed) -- corrected using the
 // GPA/GPB port+bit each comment names as the source of truth; worth an
 // explicit double-check against the board.
+//
+// FIELD UPDATE (V4.15.20): key clarification -- "ESP32 is NOT the boss
+// here." This board is an "Auto Triggered Sensor" reporting to a Siemens
+// S7-315-2 PLC, which actually runs the bottomer. Added PlcComms: PLC_
+// STATUS out (STOP/ALARM/WARNING/READY, one of 4 mutually-exclusive
+// states, binary-encoded across 3 opto outputs -- McpPin::OPTO_1 (bit 0),
+// McpPin::OPTO_2 (bit 1), ESP_OPTO_3 (bit 2/MSB), 3 bits chosen over the
+// minimum 2 for headroom beyond today's 4 states) and PLC_CONTROL in
+// (ACKNOWLEDGE + MACHINE_RUNNING, 2 independent flags, dedicated bits, no
+// encoding needed -- McpPin::INPUT_1/INPUT_2). This reclaims the 2 MCP
+// inputs V4.15.19 had tentatively reserved for Keyence Result, so Keyence
+// Result moved again -- to ESP_INPUT_3/GPIO6, a direct ESP32 GPIO with a
+// real hardware interrupt (keyenceResultIsr(), restored to its original
+// pre-V4.15.19 shape). This is a strict improvement over the V4.15.19 MCP
+// plan: it eliminates the MCP-polling-latency tradeoff entirely (MCP only
+// polls during Standby/TubeGap, never InspectingTube) rather than needing
+// a decision on whether that tradeoff was acceptable.
+//
+// Bit-to-pin assignment, the 4 status codes, and which MCP input is
+// ACKNOWLEDGE vs MACHINE_RUNNING are ALL this file's placeholder choices,
+// clearly separable in PlcComms::setStatus()/servicePlcControl() -- verify
+// against the actual S7-315-2 program before trusting them. Serial
+// commands 'P' (cycle PLC_STATUS through all 4 real states) and 'K'
+// (manual Keyence trigger pulse) added for bench/PLC-program verification;
+// '8'/'9'/'A' still do raw per-bit toggles for electrical checks but are
+// transient -- overwritten on the next real state-driven PLC_STATUS
+// update. No trigger condition exists yet for ALARM/WARNING specifically
+// (this project has no concept of "degraded but not faulted" state) --
+// only STOP (FaultStop) and READY (everything else) are automatically
+// driven; use 'P' for the other two until a real condition is defined.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -471,10 +501,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.19"
+#define FW_VERSION_STRING "V4.15.20"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_19.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_20.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -501,17 +531,30 @@ static const uint32_t DIAGNOSTIC_INTERVAL_MS = 1000;
 // NC by the field report -- never use them.
 namespace Pins {
 constexpr uint8_t KEYENCE_TRIGGER_PIN = 1;   // 24V/220ohm OUTPUT, Conn 9
-constexpr uint8_t AUXILIARY_TRIGGER_PIN = 2; // 24V/220ohm OUTPUT, Conn 8 -- function TBD, not yet wired to any logic
+// V4.15.20: bit 2 (MSB) of the 3-bit PLC_STATUS word to the S7-315-2 --
+// see the PlcComms namespace below. Real 24V/220ohm opto output, same
+// electrical class as McpPin::OPTO_1/OPTO_2 (the other 2 bits), just
+// routed through the ESP32 directly instead of the MCP23017.
+constexpr uint8_t ESP_OPTO_3 = 2; // 24V/220ohm OUTPUT, Conn 8
 // GPIO3: S3 boot-strapping pin, avoid.
 constexpr uint8_t ENCODER_PULSE_PIN = 4;     // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 7
 constexpr uint8_t PRESENCE_SENSOR_PIN = 5;   // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 6
-constexpr uint8_t AUXILIARY_SPARE_PIN = 6;   // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 5 -- function TBD, not yet wired to any logic
-// GPIO7: field report marks this NC -- Keyence Result no longer lives on a
-// direct ESP32 GPIO. Per the field report, it moves to the MCP23017
-// (McpPin::INPUT_1 or INPUT_2, exact slot not yet decided) -- see the
-// field-report comment above the McpPin namespace for why this reopens a
-// previously-documented latency tradeoff, and keyenceResultPending's own
-// comment for the current (dormant) state of that wiring.
+// V4.15.20: reassigned to Keyence Result. The 2 MCP inputs (INPUT_1/
+// INPUT_2) are now spoken for by PLC_CONTROL (ACKNOWLEDGE/MACHINE_RUNNING,
+// see PlcComms namespace) instead, so Keyence Result needed a new home --
+// this direct ESP32 GPIO is a strictly better fit than the MCP ever was:
+// restores the original hardware-interrupt mechanism (keyenceResultIsr()),
+// eliminating the MCP-polling latency tradeoff entirely (MCP is only
+// polled during Standby/TubeGap, never InspectingTube -- exactly why
+// Keyence Result was on a direct GPIO in the first place, before V4.15.19
+// tentatively moved it to MCP for lack of a better slot at the time).
+// This is my call, not yet confirmed with the user -- flag if ESP_INPUT_3
+// was meant for something else.
+constexpr uint8_t ESP_INPUT_3 = 6;   // 24V/10K-1.5K divider -> 3.2V INPUT, Conn 5
+// GPIO7: field report marks this NC -- never use it. Keyence Result's
+// original GPIO7 slot moved twice since: briefly to the MCP23017
+// (V4.15.19), then to ESP_INPUT_3/GPIO6 (V4.15.20, see that pin's own
+// comment) once the MCP inputs were claimed by PLC_CONTROL instead.
 constexpr uint8_t I2C_SDA = 8;
 constexpr uint8_t I2C_SCL = 9;
 // GPIO10, GPIO11: field report marks these NC.
@@ -901,12 +944,19 @@ constexpr uint8_t ELED_R = 12; // GPB4, OUTPUT
 constexpr uint8_t ELED_G = 13; // GPB5, OUTPUT
 constexpr uint8_t ELED_B = 14; // GPB6, OUTPUT
 constexpr uint8_t SPARE_7 = 15; // GPB7, OUTPUT (3.3V/470ohm) -- function TBD
-// Generic 24V I/O -- function TBD (Keyence Result is slated for one of
-// INPUT_1/INPUT_2 per field report, exact slot not yet decided)
+// V4.15.20: the ESP32 is NOT the boss here -- it's an "Auto Triggered
+// Sensor" reporting to a Siemens S7-315-2 PLC, which actually runs the
+// bottomer. These 2 inputs + 2 outputs (plus ESP_OPTO_3, the 3rd status
+// bit) are that link -- see the PlcComms namespace below for the encoding.
+// INPUT_1/INPUT_2 carry the S7's 2 independent control flags (dedicated
+// one bit each, not encoded -- ACKNOWLEDGE and MACHINE_RUNNING can be true
+// or false in any combination, unlike PLC_STATUS's 4 mutually-exclusive
+// states). Which physical input is which is my placeholder pairing below
+// (PlcComms::readPlcControl()) -- confirm against the S7 program.
 constexpr uint8_t INPUT_2 = 0; // GPA0, INPUT, Conn 1
-constexpr uint8_t OPTO_2 = 1;  // GPA1, OUTPUT (24V/220ohm), Conn 3
+constexpr uint8_t OPTO_2 = 1;  // GPA1, OUTPUT (24V/220ohm), Conn 3 -- PLC_STATUS bit 1
 constexpr uint8_t INPUT_1 = 2; // GPA2, INPUT, Conn 2
-constexpr uint8_t OPTO_1 = 3;  // GPA3, OUTPUT (24V/220ohm), Conn 4
+constexpr uint8_t OPTO_1 = 3;  // GPA3, OUTPUT (24V/220ohm), Conn 4 -- PLC_STATUS bit 0
 } // namespace McpPin
 
 bool mcpOk = false;
@@ -1074,24 +1124,19 @@ private:
 
 KeyenceTrigger keyenceTrigger;
 
-// DORMANT (V4.15.19): Keyence Result used to be a direct ESP32 GPIO
-// (GPIO7) with a hardware interrupt (keyenceResultIsr(), CHANGE-triggered)
-// -- removed because the final hardware map marks GPIO7 NC. Per field
-// report, Keyence Result now lives on the MCP23017 (McpPin::INPUT_1 or
-// INPUT_2), which is only decided in principle, not in which exact slot,
-// and not yet wired into this state -- nothing currently sets
-// keyenceResultPending/keyenceResultPass, so handleKeyenceResult() never
-// fires. This reopens a previously-documented tradeoff: the MCP is only
-// polled during Standby/TubeGap (~20ms cadence), never during
-// InspectingTube, which was the exact reason Keyence Result was kept off
-// MCP originally (a signal that must be actionable mid-tube-pass can't
-// ride on a polling gap that wide). Needs: which INPUT_1/INPUT_2 slot,
-// active level/polarity, and a decision on whether MCP polling itself
-// must now cover InspectingTube too.
+// RESTORED (V4.15.20): Keyence Result is a direct ESP32 GPIO again
+// (ESP_INPUT_3/GPIO6) with a hardware interrupt, same shape as the
+// original pre-V4.15.19 design -- see ESP_INPUT_3's own comment for why.
+// This resolves the MCP-polling-latency tradeoff V4.15.19 introduced
+// entirely, rather than needing a decision on it.
 static const int KEYENCE_RESULT_ACTIVE_LEVEL = HIGH; // PLACEHOLDER, not confirmed
 
 volatile bool keyenceResultPending = false;
 volatile bool keyenceResultPass = false;
+void IRAM_ATTR keyenceResultIsr() {
+  keyenceResultPass = digitalRead(Pins::ESP_INPUT_3) == KEYENCE_RESULT_ACTIVE_LEVEL;
+  keyenceResultPending = true;
+}
 
 // =====================================================================
 // NS12 HMI / Memory Link protocol
@@ -2446,15 +2491,47 @@ uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
 #endif
 
-// V4.15.19 direct I/O test rig state -- covers the 3 real inputs that
-// don't have dedicated logic elsewhere yet: AUXILIARY_SPARE_PIN (ESP
-// direct) and the 2 generic MCP23017 inputs. Declared here (ahead of
-// printDiagnostics(), which reports it) for the same reason buttonState[]
-// is; the servicing function (serviceIoTest()) that updates it is defined
-// later, after printDiagnostics().
-bool ioTestAuxSpareState = false;
-bool ioTestMcpInputState[2] = {false, false}; // [0]=INPUT_1, [1]=INPUT_2
-uint32_t lastIoTestMcpPollMs = 0;
+// =====================================================================
+// PlcComms (V4.15.20) -- the link to the Siemens S7-315-2 that actually
+// runs the bottomer. This ESP32 is an "Auto Triggered Sensor" reporting
+// to that PLC, not the boss of the line. Two directions:
+//
+//   ESP32 -> PLC: PLC_STATUS, one of 4 mutually-exclusive states (STOP/
+//   ALARM/WARNING/READY), binary-encoded across 3 opto-isolated 24V
+//   outputs (2 bits would exactly fit today's 4 states with zero spare;
+//   3 bits leaves headroom -- ESP_OPTO_3 is bit 2/MSB, McpPin::OPTO_1 is
+//   bit 0, McpPin::OPTO_2 is bit 1. Bit-to-pin assignment and the STOP=0/
+//   ALARM=1/WARNING=2/READY=3 code values are both this file's choice,
+//   not yet confirmed against the S7 program -- verify before relying on
+//   it, and update setPlcStatus()/PlcStatus together if either needs to
+//   change).
+//
+//   PLC -> ESP32: PLC_CONTROL, 2 independent flags (ACKNOWLEDGE,
+//   MACHINE_RUNNING -- unlike PLC_STATUS these can be true/false in any
+//   combination, so each gets its own dedicated bit, no encoding) read
+//   from McpPin::INPUT_1/INPUT_2. Which physical input is which is also
+//   this file's placeholder pairing -- confirm against the S7 program.
+//   Read only during Standby/TubeGap, same ~20ms-cadence restriction as
+//   the rest of this file's MCP polling (an I2C transaction every loop()
+//   iteration would cost InspectingTube latency it can't afford) -- flag
+//   to the user if the S7 program needs to see these change faster than
+//   that, e.g. mid-tube-pass.
+// =====================================================================
+namespace PlcComms {
+enum class PlcStatus : uint8_t { STOP = 0, ALARM = 1, WARNING = 2, READY = 3 };
+
+void setStatus(PlcStatus s) {
+  uint8_t code = static_cast<uint8_t>(s);
+  digitalWrite(Pins::ESP_OPTO_3, (code >> 2) & 1);
+  if (!mcpOk) return;
+  mcp.digitalWrite(McpPin::OPTO_1, (code >> 0) & 1);
+  mcp.digitalWrite(McpPin::OPTO_2, (code >> 1) & 1);
+}
+} // namespace PlcComms
+
+bool plcAcknowledge = false;
+bool plcMachineRunning = false;
+PlcComms::PlcStatus plcLastCommandedStatus = PlcComms::PlcStatus::STOP;
 
 void serviceHmiInputPolling() {
 #if NS12_ENABLE_RM_POLLING
@@ -2571,14 +2648,16 @@ void printDiagnostics() {
 #else
   Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
-  // V4.15.19 direct I/O test rig -- independent of NS12. AUXILIARY_TRIGGER
-  // and the 9 MCP outputs are print-on-demand via their toggle commands'
-  // own Serial output, not repeated here every diagnostics tick.
-  Serial.printf("AUXILIARY_SPARE_PIN (GPIO%u) : %s   AUXILIARY_TRIGGER_PIN (GPIO%u) : %s\n",
-                Pins::AUXILIARY_SPARE_PIN, ioTestAuxSpareState ? "1" : "0",
-                Pins::AUXILIARY_TRIGGER_PIN, digitalRead(Pins::AUXILIARY_TRIGGER_PIN) ? "1" : "0");
-  Serial.printf("MCP INPUT_1/INPUT_2 : %d / %d   (Keyence Result candidate slots, function TBD)\n",
-                ioTestMcpInputState[0], ioTestMcpInputState[1]);
+  // V4.15.20: S7-315-2 PLC comms + Keyence Result (see PlcComms namespace
+  // and keyenceResultIsr()). Raw per-bit toggles for OPTO_1/OPTO_2/
+  // ESP_OPTO_3 stay available via serial commands '8'/'9'/'A' for
+  // electrical verification -- not repeated here every diagnostics tick.
+  Serial.printf("PLC_STATUS (commanded) : %u (0=STOP/1=ALARM/2=WARNING/3=READY)\n",
+                (unsigned)plcLastCommandedStatus);
+  Serial.printf("PLC_CONTROL ACKNOWLEDGE/MACHINE_RUNNING : %d / %d\n", plcAcknowledge,
+                plcMachineRunning);
+  Serial.printf("Keyence Result pending/pass (ESP_INPUT_3/GPIO%u) : %d / %d\n", Pins::ESP_INPUT_3,
+                keyenceResultPending, keyenceResultPass);
   Serial.printf("NS12 32x24 experimental   : %s\n", experimental32x24Effective ? "ON" : "OFF (16x8)");
   Serial.printf("HotMelt Start/End position (mm) : %.1f / %.1f (%s)\n",
                 hotMeltStartPositionMm, hotMeltEndPositionMm,
@@ -2676,38 +2755,24 @@ void serviceHmiButtonPolling() {
 }
 
 // =====================================================================
-// V4.15.19 direct I/O test rig, covering every real pin that doesn't have
-// dedicated logic elsewhere yet: AUXILIARY_SPARE_PIN (ESP direct input)
-// and the 2 generic MCP23017 inputs (candidates for Keyence Result, exact
-// slot TBD). Edge-detects and logs immediately over Serial. The matching
-// outputs (AUXILIARY_TRIGGER_PIN, KEYENCE_TRIGGER_PIN, and the 9 MCP
-// outputs including both status RGB LEDs) are driven only by the serial
-// commands below -- verify each with a meter/LED/scope on the bench.
+// PlcComms input side -- reads the S7-315-2's 2 control flags
+// (ACKNOWLEDGE/MACHINE_RUNNING) off the MCP23017. Folded into the same
+// Standby/TubeGap-only, ~20ms-cadence MCP poll window loop() already uses
+// (see that block's own comment) rather than a separate timer, since an
+// extra independent I2C poll interval would just double the I2C traffic
+// for no benefit.
 // =====================================================================
-void serviceIoTest() {
-  bool auxPressed = (digitalRead(Pins::AUXILIARY_SPARE_PIN) == HIGH);
-  if (auxPressed != ioTestAuxSpareState) {
-    ioTestAuxSpareState = auxPressed;
-    Serial.printf("[IO-TEST] AUXILIARY_SPARE_PIN (GPIO%u) -> %s\n", Pins::AUXILIARY_SPARE_PIN,
-                  auxPressed ? "HIGH" : "LOW");
+void servicePlcControl() {
+  if (!mcpOk || !(state == SystemState::Standby || state == SystemState::TubeGap)) return;
+  bool ack = (mcp.digitalRead(McpPin::INPUT_1) == LOW); // INPUT_PULLUP: idle HIGH
+  bool running = (mcp.digitalRead(McpPin::INPUT_2) == LOW);
+  if (ack != plcAcknowledge) {
+    plcAcknowledge = ack;
+    Serial.printf("[PLC] ACKNOWLEDGE -> %s\n", ack ? "ACTIVE" : "idle");
   }
-
-  // MCP inputs: same Standby/TubeGap-only, ~20ms-cadence restriction as
-  // the rest of this file's MCP polling -- an I2C transaction on every
-  // loop() iteration would add latency InspectingTube can't afford.
-  if (mcpOk && (state == SystemState::Standby || state == SystemState::TubeGap)) {
-    uint32_t now = millis();
-    if (now - lastIoTestMcpPollMs >= MCP_POLL_INTERVAL_MS) {
-      lastIoTestMcpPollMs = now;
-      const uint8_t mcpPins[2] = {McpPin::INPUT_1, McpPin::INPUT_2};
-      for (uint8_t i = 0; i < 2; i++) {
-        bool active = (mcp.digitalRead(mcpPins[i]) == LOW); // INPUT_PULLUP: idle HIGH
-        if (active != ioTestMcpInputState[i]) {
-          ioTestMcpInputState[i] = active;
-          Serial.printf("[IO-TEST] MCP INPUT_%u -> %s\n", i + 1, active ? "ACTIVE" : "idle");
-        }
-      }
-    }
+  if (running != plcMachineRunning) {
+    plcMachineRunning = running;
+    Serial.printf("[PLC] MACHINE_RUNNING -> %s\n", running ? "ACTIVE" : "idle");
   }
 }
 
@@ -2721,9 +2786,15 @@ void serviceIoTest() {
 //   1-9        -- toggle MCP outputs, in order: ILED_R, ILED_G, ILED_B,
 //                 ELED_R, ELED_G, ELED_B, SPARE_7, OPTO_1, OPTO_2
 //                 (V4.15.19 real hardware map -- verify each with a
-//                 meter/LED on the bench)
-//   A          -- toggle AUXILIARY_TRIGGER_PIN (ESP GPIO2 direct output,
-//                 function TBD -- verify with a meter/LED)
+//                 meter/LED on the bench). NOTE: '8'/'9' are also
+//                 PLC_STATUS bits 0/1 -- a manual toggle here is transient,
+//                 overwritten on the next real state-driven PLC_STATUS
+//                 update (see loop()).
+//   A          -- toggle ESP_OPTO_3 directly (PLC_STATUS bit 2, same
+//                 transient-manual-toggle caveat as '8'/'9' above)
+//   P          -- cycle PLC_STATUS through STOP->ALARM->WARNING->READY (all
+//                 3 bits together via PlcComms::setStatus()) for bench-
+//                 verifying the encoding end-to-end against the S7 program
 //   K          -- manually fire the Keyence trigger pulse (GPIO1) for
 //                 bench-verifying that wiring independent of tube tracking
 //   M          -- diagnostic test pattern / one-shot matrix push (send 'R'
@@ -2740,9 +2811,9 @@ void serviceIoTest() {
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
 // below) and dispatch through handleHmiButtonPress() -- TEST and DIAG there
 // call the same pushTestPattern()/printDiagnostics() as 'M' and 'D' here.
-// AUXILIARY_SPARE_PIN and the 2 MCP inputs (serviceIoTest(), above) are a
-// separate, NS12-independent proof rig -- a change there logs immediately
-// and is NOT related to the HMI buttons.
+// PLC_CONTROL (servicePlcControl(), above) and Keyence Result
+// (keyenceResultIsr()) are unrelated to any of this -- the S7-315-2 PLC
+// link and the Keyence sensor, not the HMI.
 // =====================================================================
 void handleSerialCommand(char c) {
   switch (c) {
@@ -2765,9 +2836,9 @@ void handleSerialCommand(char c) {
     break;
   }
   case 'A': {
-    bool newState = !digitalRead(Pins::AUXILIARY_TRIGGER_PIN);
-    digitalWrite(Pins::AUXILIARY_TRIGGER_PIN, newState);
-    Serial.printf("[IO-TEST] AUXILIARY_TRIGGER_PIN (GPIO%u) -> %s\n", Pins::AUXILIARY_TRIGGER_PIN,
+    bool newState = !digitalRead(Pins::ESP_OPTO_3);
+    digitalWrite(Pins::ESP_OPTO_3, newState);
+    Serial.printf("[IO-TEST] ESP_OPTO_3 (GPIO%u) -> %s\n", Pins::ESP_OPTO_3,
                   newState ? "HIGH" : "LOW");
     break;
   }
@@ -2775,6 +2846,14 @@ void handleSerialCommand(char c) {
     keyenceTrigger.fire();
     Serial.println(F("[IO-TEST] Keyence trigger pulse fired (GPIO1)."));
     break;
+  case 'P': {
+    static const char *kStatusNames[4] = {"STOP", "ALARM", "WARNING", "READY"};
+    uint8_t nextCode = (static_cast<uint8_t>(plcLastCommandedStatus) + 1) % 4;
+    plcLastCommandedStatus = static_cast<PlcComms::PlcStatus>(nextCode);
+    PlcComms::setStatus(plcLastCommandedStatus);
+    Serial.printf("[PLC] PLC_STATUS -> %u (%s)\n", nextCode, kStatusNames[nextCode]);
+    break;
+  }
   case 'M':
     pushTestPattern();
     break;
@@ -2894,12 +2973,21 @@ void setup() {
   keyenceTrigger.begin(Pins::KEYENCE_TRIGGER_PIN);
   encoder.begin(Pins::ENCODER_PULSE_PIN);
 
-  // AUXILIARY_TRIGGER_PIN/AUXILIARY_SPARE_PIN (V4.15.19): confirmed wired,
-  // function not yet assigned. Configured here purely for I/O testing
-  // (serial commands 'A' and diagnostics below) -- no behavior attached.
-  pinMode(Pins::AUXILIARY_TRIGGER_PIN, OUTPUT);
-  digitalWrite(Pins::AUXILIARY_TRIGGER_PIN, LOW);
-  pinMode(Pins::AUXILIARY_SPARE_PIN, INPUT_PULLDOWN);
+  // ESP_OPTO_3 (V4.15.20): PLC_STATUS bit 2 -- see PlcComms namespace.
+  // Starts LOW (code 0 = STOP), matching plcLastCommandedStatus's default
+  // and the MCP outputs' own LOW init above, so there's no boot-time
+  // mismatch before the first loop() iteration corrects it to READY/STOP
+  // as appropriate.
+  pinMode(Pins::ESP_OPTO_3, OUTPUT);
+  digitalWrite(Pins::ESP_OPTO_3, LOW);
+
+  // ESP_INPUT_3 (V4.15.20): Keyence Result, restored to a direct-GPIO
+  // hardware interrupt -- see keyenceResultIsr()'s comment for why.
+  // PULLDOWN: same reasoning as PRESENCE_SENSOR_PIN above -- defined idle
+  // state, effectively a no-op given the real 24V/10K-1.5K divider on this
+  // pin, kept for consistency.
+  pinMode(Pins::ESP_INPUT_3, INPUT_PULLDOWN);
+  attachInterrupt(digitalPinToInterrupt(Pins::ESP_INPUT_3), keyenceResultIsr, CHANGE);
 
   fpsWindowStartMs = millis();
   lastDiagnosticMs = millis();
@@ -2938,11 +3026,12 @@ void loop() {
   // a poll cycle later than it otherwise would is a fair trade.
   serviceHmiInputPolling();
   serviceHmiButtonPolling();
-  serviceIoTest(); // V4.15.19 direct I/O test rig -- see its own comment
 
-  // MCP polled only during Standby/TubeGap, ~20ms cadence -- see
-  // keyenceResultPending's comment for why that matters now that Keyence
-  // Result is slated to live here.
+  // MCP polled only during Standby/TubeGap, ~20ms cadence -- Keyence
+  // Result no longer depends on this (V4.15.20 restored it to a direct-
+  // GPIO hardware interrupt, see keyenceResultIsr()), but PLC_CONTROL
+  // (servicePlcControl(), below) does -- flag to the S7 side if it needs
+  // ACKNOWLEDGE/MACHINE_RUNNING visibility faster than this.
   //
   // REMOVED (V4.15.19): the old MACHINE_STOPPED/AUTO reads that drove
   // Standby->WaitingForTube and the machineStopped->enterFaultStop() fault
@@ -2958,10 +3047,25 @@ void loop() {
     uint32_t now = millis();
     if (now - lastMcpPollMs >= MCP_POLL_INTERVAL_MS) {
       lastMcpPollMs = now;
+      servicePlcControl();
       if (state == SystemState::TubeGap) {
         state = SystemState::WaitingForTube;
         capture.rearm();
       }
+    }
+  }
+
+  // PLC_STATUS output: STOP whenever FaultStop, READY otherwise. ALARM and
+  // WARNING have no trigger condition defined yet -- this project has no
+  // existing concept of a "warning, but not a fault" state to map onto
+  // them; use 'P' to drive them manually for bench/PLC-program testing
+  // until a real condition is decided.
+  {
+    PlcComms::PlcStatus wantStatus =
+        (state == SystemState::FaultStop) ? PlcComms::PlcStatus::STOP : PlcComms::PlcStatus::READY;
+    if (wantStatus != plcLastCommandedStatus) {
+      plcLastCommandedStatus = wantStatus;
+      PlcComms::setStatus(wantStatus);
     }
   }
 
