@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.29
+// Ref: TGIS-510_cpp_V4_15.30
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -639,6 +639,26 @@
 // short real hold. Diagnostic-only, self-reverting after the duration --
 // no change to normal-mode polling cadence or press dispatch.
 //
+// FIELD UPDATE (V4.15.30): the V4.15.29 burst probe returned a very clean
+// answer -- across dozens of rapid-fire samples spanning real button
+// presses, every address held its exact value with zero variation:
+// $B30=004A, $B31=004B, $B32=0036, $B33=0037, $B34=0038, every single time.
+// That's not noise and it's not a live bit -- it's static content that
+// never once responded to a genuine touch. RB_BIT_ADDRESS_OFFSET reuses the
+// identical constant (16384/0x4000) already confirmed correct for RM's $W
+// (word) reads. If that value is actually this PT's *word*-area code
+// rather than an offset specific to bit reads, RB($B30..34) would be
+// silently landing on $W30..$W34 instead -- real, valid memory (hence no
+// timeouts), inside the "$W13-$W499 confirmed free" range from the real
+// Symbol Table (explaining the static, unrelated-looking content), but
+// never the true $B bit area at all. Added a 'V' serial command: reads
+// $W30..$W34 via the independently-confirmed-correct RM path and prints
+// each for direct comparison against RB's values. An exact match proves
+// RB has been reading word memory all along, not bit memory -- the real
+// bug would then be the offset (or the RB command's address encoding
+// entirely), never the `& 1` bit-position extraction this file spent
+// V4.15.15-27 tuning on data that was never a real bit to begin with.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -670,10 +690,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.29"
+#define FW_VERSION_STRING "V4.15.30"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_29.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_30.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2746,6 +2766,24 @@ void handlePresenceEdge() {
 #if NS12_ENABLE_RM_POLLING
 uint32_t lastHmiPollMs = 0;
 uint8_t nextHmiPollIndex = 0;
+
+// V4.15.30: word-vs-bit address verification walk ('V' serial command).
+// The V4.15.29 burst-probe proved RB($B30..$B34) returns perfectly STATIC
+// values (004A/004B/0036/0037/0038, unchanged across dozens of rapid
+// samples spanning real button presses) -- not noise, not live state, just
+// fixed content unrelated to the physical switches. RB_BIT_ADDRESS_OFFSET
+// reuses the exact same 16384 (0x4000) already confirmed correct for RM's
+// $W (word) reads -- if that constant is actually this PT's *word* memory
+// area code rather than a bit-read-specific offset, then RB($B30..34) is
+// silently landing on $W30..$W34 (real, valid, but unrelated memory,
+// consistent with it sitting inside the "$W13-$W499 confirmed free" range
+// found in the real Symbol Table) instead of true bit memory. This walks
+// $W30..$W34 via the independently-confirmed-correct RM path so the two
+// can be compared directly: if RM($W30..34) == RB($B30..34) exactly, that
+// proves RB is reading word memory, not bit memory, and offset -- not bit
+// position -- is the real bug. -1 = idle; 0..4 = which of $W30..$W34 is
+// currently being requested.
+int8_t wordVerifyIndex = -1;
 #endif
 
 // HMI push-button polling state (V4.15.12). Declared here (ahead of
@@ -2842,7 +2880,15 @@ PlcComms::PlcStatus plcLastCommandedStatus = PlcComms::PlcStatus::STOP;
 void serviceHmiInputPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
-  if (!ns12.isReadPending() && now - lastHmiPollMs >= NS12::RM_POLL_INTERVAL_MS) {
+  // V4.15.30: the word-vs-bit verify walk takes priority over the normal
+  // position poll while active -- it's a short, deliberate 5-step manual
+  // test ('V'), not a background cadence, so it fires as soon as the link
+  // is free rather than waiting for RM_POLL_INTERVAL_MS.
+  if (wordVerifyIndex >= 0) {
+    if (!ns12.isReadPending()) {
+      ns12.requestRM((uint16_t)(30 + wordVerifyIndex), 1);
+    }
+  } else if (!ns12.isReadPending() && now - lastHmiPollMs >= NS12::RM_POLL_INTERVAL_MS) {
     lastHmiPollMs = now;
     uint16_t addr = (nextHmiPollIndex == 0) ? NS12::HOTMELT_START_POSITION_ADDR
                                              : NS12::HOTMELT_END_POSITION_ADDR;
@@ -2852,7 +2898,18 @@ void serviceHmiInputPolling() {
 
   uint16_t addr, value;
   if (ns12.consumeReadWord(addr, value)) {
-    if (addr == NS12::HOTMELT_START_POSITION_ADDR) {
+    if (wordVerifyIndex >= 0 && addr == (uint16_t)(30 + wordVerifyIndex)) {
+      static const char *const kVerifyNames[5] = {"SETUP", "ALARM LOG", "TREND FULL", "TEST",
+                                                    "DIAG"};
+      Serial.printf("[WORD-VERIFY] RM $W%u (%s) = 0x%04X\n", (unsigned)(30 + wordVerifyIndex),
+                    kVerifyNames[wordVerifyIndex], value);
+      wordVerifyIndex++;
+      if (wordVerifyIndex >= 5) {
+        wordVerifyIndex = -1;
+        Serial.println(F("[WORD-VERIFY] Done -- compare these 5 values against the "
+                          "[HMI-RAW] lines for the same buttons."));
+      }
+    } else if (addr == NS12::HOTMELT_START_POSITION_ADDR) {
       hotMeltStartPositionMm = (float)value * HMI_POSITION_MM_PER_COUNT;
       hotMeltPositionsFromHmi = true;
     } else if (addr == NS12::HOTMELT_END_POSITION_ADDR) {
@@ -3172,6 +3229,11 @@ void servicePlcControl() {
 //                 normal 750ms-per-button round-robin, so a held real press
 //                 is guaranteed several [NS12-RB-FRAME]/[HMI-RAW] samples
 //                 during the touch instead of maybe zero
+//   V          -- word-vs-bit verify walk (V4.15.30): reads $W30..$W34 via
+//                 RM (the independently-confirmed-correct word path) and
+//                 prints each, so they can be compared directly against
+//                 RB's [HMI-RAW] $B30..$B34 values -- an exact match proves
+//                 RB is silently landing on word memory, not bit memory
 //
 // Separately, the HMI's own SETUP/ALARM LOG/TREND FULL/TEST/DIAG push-
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
@@ -3279,6 +3341,13 @@ void handleSerialCommand(char c) {
                   "[NS12-RB-FRAME]/[HMI-RAW] lines on its address.\n",
                   (unsigned long)BURST_PROBE_DURATION_MS);
     break;
+#if NS12_ENABLE_RM_POLLING
+  case 'V':
+    wordVerifyIndex = 0;
+    Serial.println(F("[WORD-VERIFY] Reading $W30..$W34 via RM (confirmed-correct word path) -- "
+                      "compare against the RB [HMI-RAW] values for $B30..$B34."));
+    break;
+#endif
   default:
     break;
   }
