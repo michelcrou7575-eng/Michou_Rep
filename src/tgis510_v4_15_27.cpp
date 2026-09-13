@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.26
+// Ref: TGIS-510_cpp_V4_15.27
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -582,6 +582,26 @@
 // dump (not just a live Serial line caught at the right instant) that
 // presses are registering.
 //
+// FIELD UPDATE (V4.15.27): field report -- even after the V4.15.25 $W0 fix,
+// ALARM LOG and TEST still fire phantom presses (lifetime counters 6 and 5
+// with nobody touching the screen) while genuine touches on ANY of the 5
+// buttons register zero. That combination retroactively casts doubt on the
+// V4.15.15 fix this file has relied on since: `value & 1` (LSB) was derived
+// from exactly two captured samples (0x4B, 0x37) that were simply assumed to
+// be genuine presses because they were nonzero -- if either was itself a
+// phantom/garbage read, the whole LSB theory rests on no confirmed-good
+// data at all. Rather than propose a fourth bit-position guess blind,
+// NS12Manager::consumeReadBit() now also returns the complete raw word
+// (lastReadWordValue, unmasked) via a new rawValueOut parameter, and
+// serviceHmiButtonPolling() logs it unconditionally as "[HMI-RAW] <name>
+// $Bxx raw=0x.... bit0=.." on every poll of every button. This is
+// diagnostic-only -- no behavior change to press detection/dispatch --
+// meant to produce one unambiguous, timestamped trace of raw values while a
+// button is deliberately held pressed vs. deliberately left untouched, so
+// the actual bit (or non-bit -- possibly a value that only settles after
+// several polls, or an address that isn't independent at all) can be read
+// off real evidence instead of guessed again.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -613,10 +633,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.26"
+#define FW_VERSION_STRING "V4.15.27"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_26.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_27.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1891,9 +1911,16 @@ public:
   // content. `!= 0` happened to work by coincidence on these two samples
   // but would misfire on any nonzero-even value; `& 1` extracts the
   // intended bit regardless of what's in the rest of the word.
-  bool consumeReadBit(uint16_t &addrOut, bool &valueOut) {
+  // V4.15.27: rawValueOut added -- field data disproved the V4.15.15 bit-0
+  // theory (phantom presses persist on the same 2 buttons regardless of
+  // touch, real touches don't register on any button), so this exposes
+  // the full raw word for a dedicated per-button diagnostic
+  // (serviceHmiButtonPolling()) that logs it directly, rather than
+  // guessing another fixed bit position blind.
+  bool consumeReadBit(uint16_t &addrOut, bool &valueOut, uint16_t &rawValueOut) {
     if (!lastReadValid || lastReadKind != ReadKind::Bit) return false;
     addrOut = (uint16_t)(lastReadAddrValue - NS12::RB_BIT_ADDRESS_OFFSET);
+    rawValueOut = lastReadWordValue;
     valueOut = (lastReadWordValue & 1) != 0;
     lastReadValid = false;
     return true;
@@ -2951,9 +2978,18 @@ void serviceHmiButtonPolling() {
 
   uint16_t addr;
   bool pressed;
-  if (ns12.consumeReadBit(addr, pressed)) {
+  uint16_t rawValue;
+  if (ns12.consumeReadBit(addr, pressed, rawValue)) {
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != addr) continue;
+
+      // V4.15.27: raw-word diagnostic -- see the NS12Manager::consumeReadBit()
+      // comment. Printed unconditionally (not just on a state change) so a
+      // controlled hold/release test has a clean, complete trace to read
+      // back, rather than only the moments this file's own (now-suspect)
+      // `& 1` extraction happened to flip.
+      Serial.printf("[HMI-RAW] %-11s $B%-3u raw=0x%04X bit0=%u\n", kButtonNames[i],
+                    kButtonAddrs[i], rawValue, (unsigned)(rawValue & 1));
 
       // V4.15.23: field report -- genuine phantom presses (buttons firing
       // with nobody touching the screen) while RB itself sat at 100%
