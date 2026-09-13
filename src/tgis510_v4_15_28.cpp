@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.27
+// Ref: TGIS-510_cpp_V4_15.28
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -602,6 +602,26 @@
 // several polls, or an address that isn't independent at all) can be read
 // off real evidence instead of guessed again.
 //
+// FIELD UPDATE (V4.15.28): the V4.15.27 raw-word capture came back with
+// nobody touching the screen: $B34(DIAG)=0x38, $B33(TEST)=0x37,
+// $B32(TREND FULL)=0x36, $B30(SETUP)=0x4A. Three of the four move in exact
+// lockstep with their own requested address ($B32/$B33/$B34 -> raw =
+// address+22, precisely) -- a real boolean bit can never track the address
+// it was read from like that. This points at the response FRAME itself,
+// not the final integer: either the wrong one of parseReadResponse()'s two
+// candidateOffsets (3 or 4) is validating by coincidence, or the PT's RB
+// data field is wider than the single "0"/"1" character this code has
+// always assumed, and bytes belonging to the address/count fields (or a
+// neighboring frame) are bleeding into what gets stored as the button's
+// value. dumpRejectedLine() already prints raw bytes on a parse FAILURE,
+// but these RB reads are structurally succeeding (addr+count match), so
+// that path never fires -- there was no visibility into a "successful"
+// frame's actual content. Added an unconditional (not gated by
+// NS12_DEBUG_RAW_RX) per-successful-RB-poll dump logging the matched
+// offset plus the literal addrText/countText/dataText substrings and raw
+// line bytes, so the next capture shows the real wire frame instead of
+// only its (apparently untrustworthy) parsed value.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -633,10 +653,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.27"
+#define FW_VERSION_STRING "V4.15.28"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_27.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_28.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2176,6 +2196,36 @@ private:
       lastReadWordValue = (uint16_t)parsedValue;
       lastReadKind = (pendingCmdType == 'B') ? ReadKind::Bit : ReadKind::Word;
       lastReadValid = true;
+
+      // V4.15.28: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
+      // dump for every successful RB parse -- mirrors dumpRejectedLine()'s
+      // "don't gate the evidence that actually answers the question" policy.
+      // V4.15.27's raw-word diagnostic showed 3 of 4 untouched buttons
+      // returning values that move in lockstep with their own address
+      // ($B32/$B33/$B34 -> raw = address+22 exactly), which a boolean bit
+      // can never do -- so the open question is now about the FRAME ITSELF
+      // (which candidateOffset validated, how wide the data field actually
+      // was) rather than the final parsed integer. This prints exactly
+      // that: the literal addr/count/data text fields as received and the
+      // raw bytes of the whole line, once per successful RB poll (~750ms
+      // cadence across 5 buttons -- not a firehose).
+      if (pendingCmdType == 'B') {
+        Serial.print(F("[NS12-RB-FRAME] offset="));
+        Serial.print(offset);
+        Serial.print(F(" addrText=\""));
+        Serial.print(addrText);
+        Serial.print(F("\" countText=\""));
+        Serial.print(countText);
+        Serial.print(F("\" dataText=\""));
+        Serial.print(dataText);
+        Serial.print(F("\" dataLen="));
+        Serial.print(dataLen);
+        Serial.print(F(" raw ("));
+        Serial.print(len);
+        Serial.print(F(" bytes): "));
+        for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
+        Serial.println();
+      }
 #if NS12_DEBUG_RAW_RX
       // V4.15.13: RB successes need the same raw-bytes visibility failures
       // already had (dumpRejectedLine) -- added after real hardware showed
