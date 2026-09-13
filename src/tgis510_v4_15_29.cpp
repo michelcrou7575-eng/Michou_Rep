@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.28
+// Ref: TGIS-510_cpp_V4_15.29
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -622,6 +622,23 @@
 // line bytes, so the next capture shows the real wire frame instead of
 // only its (apparently untrustworthy) parsed value.
 //
+// FIELD UPDATE (V4.15.29): the V4.15.28 raw-frame dump confirmed the data
+// field is a genuine 4-hex-digit WORD (e.g. "ESC RB401F01004B", dataText=
+// "004B") -- structurally identical to an RM response, not the single "0"/
+// "1" character this code assumed since V4.15.12. Address math still
+// checks out (401F = 31+16384 for ALARM LOG). A controlled hold test on
+// SETUP ($B30) then came back ambiguous: dataText stayed "004A" every time
+// it was sampled, but at BUTTON_POLL_INTERVAL_MS=750ms round-robin across 5
+// buttons, any one button is only actually queried once every ~3.75s --
+// a 2-3s hold can easily complete without a single read ever landing
+// during the touch. That result cannot distinguish "no bit lives in this
+// word" from "we just didn't sample it while pressed". Added an 'H' serial
+// command: burst-probe mode polls all 5 buttons back-to-back (bounded only
+// by the link's own turnaround, not the 750ms cadence) for
+// BURST_PROBE_DURATION_MS, guaranteeing several samples land during even a
+// short real hold. Diagnostic-only, self-reverting after the duration --
+// no change to normal-mode polling cadence or press dispatch.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -653,10 +670,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.28"
+#define FW_VERSION_STRING "V4.15.29"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_28.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_29.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2754,6 +2771,21 @@ bool pendingButtonRead[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
+
+// V4.15.29: burst-probe mode ('H' serial command) -- the normal
+// BUTTON_POLL_INTERVAL_MS=750ms round-robin across 5 buttons only samples
+// any ONE of them every ~3.75s. A held-button test (checking whether the
+// underlying raw word ever changes) at that cadence can easily hold for
+// 2-3 seconds and still never land a read during the actual touch --
+// exactly the ambiguous "held it and 004A showed 3 times" result seen in
+// the field, which doesn't distinguish "no bit exists in this word" from
+// "we just didn't happen to sample it while pressed". While active, the
+// interval below drops to 0 (still bounded by isReadPending()/txBusy, so
+// it can't exceed the link's real turnaround), sampling all 5 addresses
+// back-to-back for BURST_PROBE_DURATION_MS so a hold of even ~1s is
+// guaranteed several reads during the press.
+uint32_t burstProbeUntilMs = 0;
+constexpr uint32_t BURST_PROBE_DURATION_MS = 8000;
 // V4.15.26: buttonState[] gets force-cleared back to false inside the same
 // call that detects a press (so the very next press is a fresh edge
 // without an extra poll-cycle's delay) -- meaning the "confirmed pressed"
@@ -3020,7 +3052,8 @@ void handleHmiButtonPress(uint8_t index) {
 void serviceHmiButtonPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
-  if (!ns12.isReadPending() && now - lastButtonPollMs >= NS12::BUTTON_POLL_INTERVAL_MS) {
+  uint32_t pollInterval = (now < burstProbeUntilMs) ? 0 : NS12::BUTTON_POLL_INTERVAL_MS;
+  if (!ns12.isReadPending() && now - lastButtonPollMs >= pollInterval) {
     lastButtonPollMs = now;
     ns12.requestRB(kButtonAddrs[nextButtonPollIndex], 1);
     nextButtonPollIndex = (nextButtonPollIndex + 1) % NS12::BUTTON_COUNT;
@@ -3134,6 +3167,11 @@ void servicePlcControl() {
 //   X          -- frame dump: raw-delta (live) vs one-off calibrated C
 //   R          -- rearm capture latch AND clear the HMI display to blank
 //   D          -- print diagnostics immediately
+//   H          -- HMI button burst-probe (V4.15.29): polls all 5 buttons
+//                 back-to-back for BURST_PROBE_DURATION_MS instead of the
+//                 normal 750ms-per-button round-robin, so a held real press
+//                 is guaranteed several [NS12-RB-FRAME]/[HMI-RAW] samples
+//                 during the touch instead of maybe zero
 //
 // Separately, the HMI's own SETUP/ALARM LOG/TREND FULL/TEST/DIAG push-
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
@@ -3234,6 +3272,12 @@ void handleSerialCommand(char c) {
   }
   case 'D':
     printDiagnostics();
+    break;
+  case 'H':
+    burstProbeUntilMs = millis() + BURST_PROBE_DURATION_MS;
+    Serial.printf("[HMI-PROBE] Burst mode ON for %lu ms -- hold any HMI button NOW, watch for "
+                  "[NS12-RB-FRAME]/[HMI-RAW] lines on its address.\n",
+                  (unsigned long)BURST_PROBE_DURATION_MS);
     break;
   default:
     break;
