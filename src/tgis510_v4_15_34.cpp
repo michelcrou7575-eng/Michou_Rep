@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.33
+// Ref: TGIS-510_cpp_V4_15.34
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -735,6 +735,25 @@
 // instead of comma-separated literal characters. Send 'J' again on this
 // build: if $B30 finally reads back bit7=1, this was the fix.
 //
+// FIELD UPDATE (V4.15.34): the V4.15.33 WB encoding fix was real (the
+// literal-'1' bug is gone) but 'J' still reads back bit7=0 via the
+// OFFSET-based RB address -- yet the user directly watched SETUP turn ON
+// on the physical screen the instant 'J' was sent. That combination is
+// the real finding here: our own write demonstrably reached the PT's
+// live, rendered memory, but the offset address RB has always read from
+// (startAddr + RB_BIT_ADDRESS_OFFSET = +16384) apparently is NOT the same
+// physical bit sendWB()'s plain address writes to. On reflection,
+// RB_BIT_ADDRESS_OFFSET's entire "confirmation" history amounts to: (a)
+// producing structurally valid, checksummed responses -- true of ANY
+// valid address in range, never proof it's the CORRECT one -- and (b) one
+// coincidence (the "33/34mm" position values that V4.15.31 proved were
+// actually checksum bytes, not real word data). Neither actually verifies
+// +16384 reads the logical object CX-Designer calls "$B30". Added an 'N'
+// serial command: writes 1 to $B30 (same as 'J'), then reads it back
+// using the exact same PLAIN address sendWB() already writes to --
+// bypassing RB_BIT_ADDRESS_OFFSET entirely -- to test directly whether
+// reads need the same unoffset address writes do.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -766,10 +785,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.33"
+#define FW_VERSION_STRING "V4.15.34"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_33.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_34.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2952,6 +2971,22 @@ int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
 // guaranteed several reads during the press.
 uint32_t burstProbeUntilMs = 0;
 constexpr uint32_t BURST_PROBE_DURATION_MS = 8000;
+
+// V4.15.34: no-offset RB read test ('N' serial command). The V4.15.33 'J'
+// test wrote 1 to $B30 via sendWB() (plain address, no offset) and the
+// user directly observed SETUP visually turn ON on the real screen -- but
+// the OFFSET-based RB read of that same logical address still reported
+// 0x00. That means the read and write may never have been touching the
+// same physical bit: RB_BIT_ADDRESS_OFFSET's "confirmation" history turns
+// out, on reflection, to have never been more than "produces a
+// structurally valid, checksummed response" (true of any valid address,
+// not proof it's the RIGHT one) plus one coincidence (the position values
+// that turned out to be checksum bytes, not real data). This reads $B30
+// back using the exact same PLAIN address sendWB() writes to, bypassing
+// RB_BIT_ADDRESS_OFFSET entirely, to test directly whether that's the
+// real fix.
+uint16_t noOffsetTestAddr = 0;
+bool noOffsetTestPending = false;
 // V4.15.26: buttonState[] gets force-cleared back to false inside the same
 // call that detects a press (so the very next press is a fresh edge
 // without an extra poll-cycle's delay) -- meaning the "confirmed pressed"
@@ -3237,11 +3272,21 @@ void handleHmiButtonPress(uint8_t index) {
 void serviceHmiButtonPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
-  uint32_t pollInterval = (now < burstProbeUntilMs) ? 0 : NS12::BUTTON_POLL_INTERVAL_MS;
-  if (!ns12.isReadPending() && now - lastButtonPollMs >= pollInterval) {
-    lastButtonPollMs = now;
-    ns12.requestRB(kButtonAddrs[nextButtonPollIndex], 1);
-    nextButtonPollIndex = (nextButtonPollIndex + 1) % NS12::BUTTON_COUNT;
+  // V4.15.34: no-offset RB test ('N' command) takes priority over the
+  // normal round-robin -- see that command's comment. Retries every tick
+  // (like the txBusy-deferred pattern elsewhere) until the link is free
+  // right after the WB write that precedes it.
+  if (noOffsetTestPending) {
+    if (!ns12.isReadPending() && ns12.requestRB(noOffsetTestAddr, 1)) {
+      noOffsetTestPending = false;
+    }
+  } else {
+    uint32_t pollInterval = (now < burstProbeUntilMs) ? 0 : NS12::BUTTON_POLL_INTERVAL_MS;
+    if (!ns12.isReadPending() && now - lastButtonPollMs >= pollInterval) {
+      lastButtonPollMs = now;
+      ns12.requestRB(kButtonAddrs[nextButtonPollIndex], 1);
+      nextButtonPollIndex = (nextButtonPollIndex + 1) % NS12::BUTTON_COUNT;
+    }
   }
 
   uint16_t addr;
@@ -3503,6 +3548,29 @@ void handleSerialCommand(char c) {
                       "Watching for bit7=1 on the next [HMI-RAW] SETUP line..."));
     break;
   }
+#if NS12_ENABLE_RM_POLLING
+  case 'N': {
+    // V4.15.34: writes 1 to $B30 (same as 'J'), then reads it back using
+    // the PLAIN address instead of the offset RB normally uses -- see
+    // noOffsetTestAddr's comment. Watch the next [NS12-FRAME] line: its
+    // addrText should read "001E" (30 decimal, the plain address), not
+    // "401E" (30+16384). If dataText is nonzero there, RB_BIT_ADDRESS_
+    // OFFSET has been wrong all along and reads need the same plain
+    // address writes already use.
+    bool oneBit = true;
+    ns12.sendWB(NS12::BUTTON_SETUP_ADDR, &oneBit, 1);
+    // requestRB() always adds RB_BIT_ADDRESS_OFFSET internally -- pre-
+    // subtracting it here (relying on uint16_t wraparound) makes that
+    // internal +16384 cancel back out to the plain address, so the wire
+    // request actually goes out unoffset.
+    noOffsetTestAddr = (uint16_t)(NS12::BUTTON_SETUP_ADDR - NS12::RB_BIT_ADDRESS_OFFSET);
+    noOffsetTestPending = true;
+    Serial.println(F("[NO-OFFSET-TEST] Wrote 1 to $B30, now reading it back via RB at the PLAIN "
+                      "address (same address WB writes to, no +16384 offset). Watch the next "
+                      "[NS12-FRAME] line -- addrText should show \"001E\", not \"401E\"."));
+    break;
+  }
+#endif
   default:
     break;
   }
