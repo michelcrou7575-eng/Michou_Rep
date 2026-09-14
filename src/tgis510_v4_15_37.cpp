@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.36
+// Ref: TGIS-510_cpp_V4_15.37
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -784,6 +784,25 @@
 // flag or guessing at the multi-bit packing again -- next lamp write will
 // show the real addr/count/raw bytes directly.
 //
+// FIELD UPDATE (V4.15.37): the V4.15.36 [NS12-WB-TX] print confirmed the
+// lamp write encoding is correct (addr=0x28, *D="80" for "SETUP lamp ON,
+// others off" -- exactly right per the packing rules), so no fix was
+// needed there. Separate field question: "why 6 sec to get a toggle?"
+// Two costs were stacking: the 5-button round-robin (750ms each = 3.75s
+// worst case to poll any one button) and the V4.15.23 2-consecutive-
+// reads debounce on top of it (up to one more full cycle, ~7.5s worst
+// case combined). That debounce was a mitigation for the checksum bug
+// (V4.15.31) and RB offset bug (V4.15.35), both since fixed and hardware-
+// confirmed clean -- checksum validation in parseReadResponse() already
+// rejects a genuinely corrupted frame outright, a stronger guarantee than
+// "wait for two reads to agree" ever was. Removed pendingButtonRead[] and
+// the debounce entirely; a single checksum-valid read is now trusted
+// directly, roughly halving worst-case detection latency to the
+// round-robin's own ~3.75s. BUTTON_POLL_INTERVAL_MS (750ms, chosen in
+// V4.15.15 to stop RM position polling from starving) is untouched here
+// -- a further latency win, but a separate, riskier change to verify
+// against RM success rate before making.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -815,10 +834,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.36"
+#define FW_VERSION_STRING "V4.15.37"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_36.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_37.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -3016,11 +3035,7 @@ constexpr uint16_t kLampAddrs[NS12::BUTTON_COUNT] = {
     NS12::LAMP_TEST_ADDR, NS12::LAMP_DIAG_ADDR};
 const char *const kButtonNames[NS12::BUTTON_COUNT] = {"SETUP", "ALARM LOG", "TREND FULL", "TEST",
                                                        "DIAG"};
-bool buttonState[NS12::BUTTON_COUNT] = {}; // debounce-confirmed state
-// V4.15.23: most recent single raw RB sample per button, NOT yet
-// confirmed -- see the 2-consecutive-reads debounce in
-// serviceHmiButtonPolling()'s comment for why this exists.
-bool pendingButtonRead[NS12::BUTTON_COUNT] = {};
+bool buttonState[NS12::BUTTON_COUNT] = {}; // last-confirmed pressed state
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
@@ -3368,40 +3383,32 @@ void serviceHmiButtonPolling() {
                     kButtonAddrs[i], rawValue, (unsigned)((rawValue & 0x80) != 0),
                     (unsigned)(rawValue & 1));
 
-      // V4.15.23: field report -- genuine phantom presses (buttons firing
-      // with nobody touching the screen) while RB itself sat at 100%
-      // success, zero parse errors, across hundreds of reads. Since RB
-      // wasn't failing (a wrong address+count wouldn't parse as success
-      // at all), a single sample clearly isn't trustworthy enough on its
-      // own -- so a transition into "pressed" is now only accepted once
-      // TWO CONSECUTIVE polls of this same button agree. A disagreement
-      // just updates the pending candidate and waits for the next poll to
-      // confirm one way or the other; it never fires handleHmiButtonPress()
-      // on its own. Costs up to one extra ~750ms poll cycle of detection
-      // latency for a real press -- an acceptable trade for not firing
-      // TEST/DIAG/lamp changes at random. Root cause still unknown (a
-      // genuinely bouncy or misbehaving switch object on the PT side? A
-      // wrong word/bit being addressed after all? -- unresolved), so this
-      // is a mitigation, not a fix.
-      if (pressed != pendingButtonRead[i]) {
-        pendingButtonRead[i] = pressed;
-        break;
-      }
-
+      // V4.15.23 field report (buttons firing with nobody touching the
+      // screen) led to a 2-consecutive-reads debounce here, costing up to
+      // one extra ~750ms poll cycle of detection latency (compounding
+      // with the 5-button round-robin's own 3.75s worst case into ~6-7.5s
+      // total, per a later field report). REMOVED in V4.15.37: that
+      // symptom's real cause turned out to be the checksum bug (V4.15.31)
+      // and the RB address offset bug (V4.15.35), both now fixed and
+      // hardware-confirmed clean (checksum-validated 0x00/0x80 reads,
+      // zero anomalies across hundreds of samples). Checksum validation
+      // in parseReadResponse() already rejects any genuinely corrupted
+      // frame outright -- a stronger guarantee than "wait for two reads
+      // to agree" ever was -- so a single accepted read is now trusted
+      // directly.
       bool wasPressed = buttonState[i];
       buttonState[i] = pressed;
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
         // Acknowledge -- clear the switch's own bit back to 0 (V4.15.14,
         // see BUTTON_SETUP_ADDR's comment). Fire-and-forget like every
-        // other WB; also clear buttonState[i]/pendingButtonRead[i]
-        // locally right away rather than waiting for the bit's next RB
-        // poll to confirm the clear landed, so the very next real press
-        // is detected as a fresh edge without an extra poll-cycle's delay.
+        // other WB; also clear buttonState[i] locally right away rather
+        // than waiting for the bit's next RB poll to confirm the clear
+        // landed, so the very next real press is detected as a fresh edge
+        // without an extra poll-cycle's delay.
         bool clearBit = false;
         ns12.sendWB(kButtonAddrs[i], &clearBit, 1);
         buttonState[i] = false;
-        pendingButtonRead[i] = false;
       }
       break;
     }
