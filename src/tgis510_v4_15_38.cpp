@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.37
+// Ref: TGIS-510_cpp_V4_15.38
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -803,6 +803,24 @@
 // -- a further latency win, but a separate, riskier change to verify
 // against RM success rate before making.
 //
+// FIELD UPDATE (V4.15.38): "we'll do toggle in HMI" -- the switches moved
+// from Momentary to native panel-side Alternate, since ESP32-side
+// detection latency (~3.75s worst case, per V4.15.37) is too slow for a
+// status lamp that needs to react the instant a finger lands. Field
+// pushback on the follow-up plan ("what good is a status lamp if it can't
+// show absolute reality") was correct: this file's own setActiveLamp()
+// (one WB-driven lamp for "whoever was pressed most recently") was never
+// a real-state indicator, only an approximation, and the host-clear-to-0
+// write on $B30-$B34 was actively WRONG for Alternate switches --
+// forcing the panel's own toggle bit back off immediately after every
+// press it was supposed to own. Both removed. $B30-$B34 are now pure
+// read-only reflections of each switch's real, panel-owned state;
+// buttonState[] mirrors that live and unconditionally (no more force-
+// clearing), so the diagnostics "instantaneous" line is finally
+// meaningful too, not just the lifetime counters. handleHmiButtonPress()
+// still fires once per rising edge for its one-shot actions (LED cycle/
+// test pattern/diagnostics) -- only the writing back stops.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -834,10 +852,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.37"
+#define FW_VERSION_STRING "V4.15.38"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_37.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_38.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1815,10 +1833,12 @@ constexpr uint16_t RB_BIT_ADDRESS_OFFSET = 16384; // no longer applied -- see co
 // what a "momentary, host-clear" CX-Designer bit switch does: the panel
 // SETS the bit on press and relies on the connected device to clear it
 // back to 0, precisely so a command isn't missed under slow host polling.
-// ESP32 now writes each bit back to 0 (via sendWB, see
-// serviceHmiButtonPolling()) immediately after dispatching its press --
-// an acknowledge, not a fight with the panel, since the panel's own next
-// press is what sets it again.
+//
+// CHANGED (V4.15.38): the switches are now configured as native panel-
+// side Alternate (self-toggling) objects, not Momentary -- see
+// serviceHmiButtonPolling()'s comment. ESP32 no longer writes back to
+// these addresses at all; the bit is purely read, and its value IS each
+// switch's real, live, current state, owned entirely by the panel.
 constexpr uint16_t BUTTON_SETUP_ADDR = 30;
 constexpr uint16_t BUTTON_ALARM_LOG_ADDR = 31;
 constexpr uint16_t BUTTON_TREND_FULL_ADDR = 32;
@@ -1835,6 +1855,12 @@ constexpr uint8_t BUTTON_COUNT = 5;
 // confirmed in V4.15.11. Contiguous and in the same SETUP/ALARM LOG/
 // TREND FULL/TEST/DIAG order as the buttons above so sendWB() can push all
 // 5 lamp states in one write.
+//
+// UNUSED (V4.15.38): setActiveLamp() removed -- the panel's own native
+// Alternate switch visual is now the sole status indicator, and it needs
+// no host write at all. Left declared for reference (still an unconfirmed
+// placeholder block, per the note above), not because anything writes to
+// them.
 constexpr uint16_t LAMP_SETUP_ADDR = 40;
 constexpr uint16_t LAMP_ALARM_LOG_ADDR = 41;
 constexpr uint16_t LAMP_TREND_FULL_ADDR = 42;
@@ -3030,15 +3056,14 @@ int8_t wordVerifyIndex = -1;
 constexpr uint16_t kButtonAddrs[NS12::BUTTON_COUNT] = {
     NS12::BUTTON_SETUP_ADDR, NS12::BUTTON_ALARM_LOG_ADDR, NS12::BUTTON_TREND_FULL_ADDR,
     NS12::BUTTON_TEST_ADDR, NS12::BUTTON_DIAG_ADDR};
-constexpr uint16_t kLampAddrs[NS12::BUTTON_COUNT] = {
-    NS12::LAMP_SETUP_ADDR, NS12::LAMP_ALARM_LOG_ADDR, NS12::LAMP_TREND_FULL_ADDR,
-    NS12::LAMP_TEST_ADDR, NS12::LAMP_DIAG_ADDR};
 const char *const kButtonNames[NS12::BUTTON_COUNT] = {"SETUP", "ALARM LOG", "TREND FULL", "TEST",
                                                        "DIAG"};
-bool buttonState[NS12::BUTTON_COUNT] = {}; // last-confirmed pressed state
+// V4.15.38: this is now the real, live, continuously-accurate state of
+// each switch -- see the FIELD UPDATE below. No more host-clear forcing
+// it back to false, no more ESP32-driven lamp approximation.
+bool buttonState[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
-int8_t activeLampIndex = -1; // -1 = no button's lamp currently lit
 
 // V4.15.29: burst-probe mode ('H' serial command) -- the normal
 // BUTTON_POLL_INTERVAL_MS=750ms round-robin across 5 buttons only samples
@@ -3063,14 +3088,14 @@ constexpr uint32_t BURST_PROBE_DURATION_MS = 8000;
 // address. Kept as a quick manual confirmation that the fix holds.
 uint16_t noOffsetTestAddr = 0;
 bool noOffsetTestPending = false;
-// V4.15.26: buttonState[] gets force-cleared back to false inside the same
-// call that detects a press (so the very next press is a fresh edge
-// without an extra poll-cycle's delay) -- meaning the "confirmed pressed"
-// state is visible for microseconds and a once-a-second diagnostics
-// snapshot will practically never catch it as "1", by design, not because
-// presses aren't registering. This lifetime counter is the actual way to
-// verify a press was detected via the periodic diagnostics dump, without
-// needing to watch Serial at the exact right moment.
+// V4.15.26: added so a press could be confirmed via the periodic
+// diagnostics dump without needing to watch Serial at the exact right
+// moment -- originally because buttonState[] was force-cleared back to
+// false immediately after every detected press (V4.15.14's host-clear),
+// so the "instantaneous" line practically never caught a real "1". As of
+// V4.15.38 buttonState[] is no longer cleared and genuinely reflects live
+// switch state, so the instantaneous line is meaningful too now -- this
+// counter stays useful regardless, as the total-presses-since-boot record.
 uint32_t buttonPressCount[NS12::BUTTON_COUNT] = {};
 #endif
 
@@ -3293,23 +3318,20 @@ void printDiagnostics() {
 // the position polling above.
 // =====================================================================
 #if NS12_ENABLE_RM_POLLING
-// Lights exactly one lamp (the most recently pressed button) and turns the
-// rest off, in a single WB write across the contiguous LAMP_*_ADDR block.
-// No-op if that button is already the active one -- avoids spamming
-// identical WB traffic every time the same button is polled and found
-// still held down.
-void setActiveLamp(int8_t index) {
-  if (activeLampIndex == index) return;
-  activeLampIndex = index;
-  bool lamps[NS12::BUTTON_COUNT];
-  for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) lamps[i] = ((int8_t)i == index);
-  ns12.sendWB(kLampAddrs[0], lamps, NS12::BUTTON_COUNT);
-}
+// REMOVED (V4.15.38): setActiveLamp() used to WB-write a single "most
+// recently pressed" lamp across $B40-$B44 -- an ESP32-driven approximation
+// that stopped being meaningful once the switches moved to native
+// panel-side Alternate toggling (see the FIELD UPDATE below): (a) it never
+// reflected any button's REAL current on/off state, only "who was pressed
+// last", and (b) this file's own host-clear-to-0 write on $B30-$B34 was
+// actively fighting the panel's own toggle bit, forcing it back off right
+// after every detected press. The panel's native Alternate visual is now
+// the sole, correct status indicator -- it IS each switch's real state,
+// continuously, with no serial round-trip involved at all.
 
 void handleHmiButtonPress(uint8_t index) {
   buttonPressCount[index]++;
   Serial.printf("[HMI] %s button pressed.\n", kButtonNames[index]);
-  setActiveLamp((int8_t)index);
   switch (index) {
   case 3: // TEST -- same one-shot pattern as the 'M' serial command
     pushTestPattern();
@@ -3345,6 +3367,21 @@ void handleHmiButtonPress(uint8_t index) {
 }
 #endif
 
+// CHANGED (V4.15.38): the switches moved from Momentary to native
+// panel-side Alternate toggling ("we'll do toggle in HMI" -- ESP32-side
+// detection latency, ~3.75s worst case round-robin, was too slow for a
+// status lamp that needs to show reality the instant a finger lands).
+// The WB host-clear-to-0 this function used to do after every detected
+// press is GONE: for a Momentary switch that acknowledge was correct
+// (the panel expects it, or the bit latches forever), but for Alternate
+// it was actively wrong -- forcing the panel's own toggle bit back off
+// immediately after every press, fighting the very state it's supposed
+// to own. buttonState[i] is no longer force-cleared either; it's now a
+// live, continuously-accurate mirror of each switch's real bit,
+// unconditionally read every poll rather than reset by our own writes.
+// handleHmiButtonPress() still fires once per rising edge (0->1) for its
+// one-shot side effects (LED cycle, test pattern, diagnostics) -- that
+// part doesn't change; only the writing back stops.
 void serviceHmiButtonPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
@@ -3396,19 +3433,19 @@ void serviceHmiButtonPolling() {
       // frame outright -- a stronger guarantee than "wait for two reads
       // to agree" ever was -- so a single accepted read is now trusted
       // directly.
+      // V4.15.38: no more host-clear-to-0 write here -- see this
+      // function's header comment. buttonState[i] is simply set to the
+      // real bit value read; the panel (Alternate switch) owns it
+      // entirely, so there is nothing for the host to acknowledge or
+      // clear anymore. handleHmiButtonPress() still fires exactly once
+      // per rising edge for its one-shot dispatch (LED cycle/test
+      // pattern/diagnostics); when the switch toggles back off, the
+      // matching falling edge is silently absorbed here (no action is
+      // currently defined for "button turned off").
       bool wasPressed = buttonState[i];
       buttonState[i] = pressed;
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
-        // Acknowledge -- clear the switch's own bit back to 0 (V4.15.14,
-        // see BUTTON_SETUP_ADDR's comment). Fire-and-forget like every
-        // other WB; also clear buttonState[i] locally right away rather
-        // than waiting for the bit's next RB poll to confirm the clear
-        // landed, so the very next real press is detected as a fresh edge
-        // without an extra poll-cycle's delay.
-        bool clearBit = false;
-        ns12.sendWB(kButtonAddrs[i], &clearBit, 1);
-        buttonState[i] = false;
       }
       break;
     }
