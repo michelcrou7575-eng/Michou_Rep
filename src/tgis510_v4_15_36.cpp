@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.35
+// Ref: TGIS-510_cpp_V4_15.36
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -770,6 +770,20 @@
 // bit7 during serviceHmiButtonPolling()'s normal round-robin, no burst
 // mode or manual WB test required.
 //
+// FIELD UPDATE (V4.15.36): buttons fully confirmed working on real
+// hardware with SETUP reverted to Momentary (the switch-type experiment
+// is no longer needed -- host-clear already handles Momentary/Alternate/
+// SET alike). Next field report: "$B40 doesn't toggle" -- the lamp write
+// (setActiveLamp() -> sendWB(kLampAddrs[0], lamps, 5)) packs 5 bits into
+// 2 hex digits, a case the V4.15.33 encoding fix was never independently
+// verified against (only the single-bit $B30 write was, via 'J'/'N').
+// sendWB() is fire-and-forget with no response, so there was no way to
+// inspect what it actually put on the wire short of the full
+// NS12_DEBUG_RAW_RX firehose. Added an unconditional per-send print
+// (mirroring RB's [NS12-FRAME]) instead of gating this evidence behind a
+// flag or guessing at the multi-bit packing again -- next lamp write will
+// show the real addr/count/raw bytes directly.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -801,10 +815,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.35"
+#define FW_VERSION_STRING "V4.15.36"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_35.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_36.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2047,11 +2061,25 @@ public:
     }
     frame[n++] = '\r';
 
-#if NS12_DEBUG_RAW_RX
-    Serial.print(F("[NS12] TX WB: "));
-    for (size_t i = 0; i < n; i++) printRawByte((uint8_t)frame[i]);
+    // V4.15.36: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
+    // print for every WB send -- mirrors the [NS12-FRAME] visibility RB
+    // already has. WB is fire-and-forget with no response to inspect, so
+    // until now the only way to check what a WB actually put on the wire
+    // was the full NS12_DEBUG_RAW_RX firehose. That gap mattered: the
+    // V4.15.33 encoding fix was only empirically verified for a single-bit
+    // write (count=1, "$B30" -> hex digit "8"); the 5-bit lamp write
+    // (count=5, 2 packed hex digits) has never been directly inspected on
+    // the wire, and a field report of "$B40 doesn't toggle" needs this
+    // evidence rather than another guess.
+    Serial.print(F("[NS12-WB-TX] addr=0x"));
+    Serial.print(startAddr, HEX);
+    Serial.print(F(" count="));
+    Serial.print(count);
+    Serial.print(F(" raw ("));
+    Serial.print(n);
+    Serial.print(F(" bytes): "));
+    for (size_t i = 0; i < n; i++) printRawByteAlways((uint8_t)frame[i]);
     Serial.println();
-#endif
 
     wbAttempts++;
     size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
