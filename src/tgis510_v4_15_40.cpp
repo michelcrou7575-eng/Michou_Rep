@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.39
+// Ref: TGIS-510_cpp_V4_15.40
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -838,6 +838,21 @@
 // line (now genuinely live, per V4.15.38) still gives the full snapshot
 // on demand.
 //
+// FIELD UPDATE (V4.15.40): "need 5 different led as status" -- each of
+// the 5 HMI switches now has its own dedicated physical LED (ILED_R/G/B,
+// ELED_R/G for SETUP/ALARM LOG/TREND FULL/TEST/DIAG respectively), lit
+// exactly when that switch is really on and off exactly when it's really
+// off. Replaces advanceLedCycle(), which only ever showed "whoever was
+// pressed most recently" cycling through one shared LED -- never a real
+// per-switch indicator, same category of problem as the removed
+// ESP32-driven lamp write (V4.15.38). setButtonStatusLed() is called from
+// serviceHmiButtonPolling() on every real state change (both edges), not
+// from handleHmiButtonPress() (rising-edge-only, one-shot dispatch) --
+// a status LED has to track the switch turning off too. TEST and DIAG
+// keep their existing one-shot actions (test pattern / diagnostics
+// print) in addition to their own dedicated status LED; SETUP/ALARM LOG/
+// TREND FULL still have no other defined action, same as before.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -869,10 +884,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.39"
+#define FW_VERSION_STRING "V4.15.40"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_39.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_40.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1355,33 +1370,14 @@ void toggleMcpOutput(uint8_t idx) {
   mcp.digitalWrite(kMcpOutputPins[idx], mcpOutputState[idx]);
 }
 
-// V4.15.24: field request -- exercise all internal AND external LEDs, not
-// just the 3 internal channels. kMcpOutputPins[0..6] are exactly the 7 LED
-// channels (internal R/G/B + external R/G/B/Y, in that order -- see the
-// array's own comment); [7]/[8] are OPTO_1/OPTO_2, not LEDs, so this stops
-// at 7. Shared round-robin, one channel lit at a time (matches the "single
-// RGB(+Y) LED" hardware -- see McpPin::ILED_R's comment): each call turns
-// off whichever channel is currently lit and turns on the next one. All 3
-// stub HMI buttons (SETUP/ALARM LOG/TREND FULL) drive this SAME sequence
-// rather than each owning a fixed channel, so any one of them exercises
-// the full 7-channel set over repeated presses, and -- usefully, while the
-// V4.15.23 phantom-press mitigation is still unresolved -- any phantom
-// firing from ANY of the 3 buttons now visibly advances the same LED
-// instead of only ever toggling ILED_G, making it obvious at a glance
-// whenever it happens again.
-constexpr uint8_t kLedChannelCount = 7;
-int8_t ledCycleActiveIndex = -1; // -1 = none lit yet
-
-void advanceLedCycle() {
-  if (!mcpOk) return;
-  if (ledCycleActiveIndex >= 0) {
-    mcpOutputState[ledCycleActiveIndex] = false;
-    mcp.digitalWrite(kMcpOutputPins[ledCycleActiveIndex], LOW);
-  }
-  ledCycleActiveIndex = (ledCycleActiveIndex + 1) % kLedChannelCount;
-  mcpOutputState[ledCycleActiveIndex] = true;
-  mcp.digitalWrite(kMcpOutputPins[ledCycleActiveIndex], HIGH);
-}
+// REMOVED (V4.15.40): advanceLedCycle() used to share one round-robin LED
+// across SETUP/ALARM LOG/TREND FULL, lighting whichever channel came next
+// on each press -- never a real per-button indicator, just an activity
+// animation (useful at the time for spotting V4.15.23's phantom presses,
+// since long since fixed). Replaced by setButtonStatusLed(), defined
+// further down alongside the other HMI button state (needs
+// NS12::BUTTON_COUNT, not yet in scope this early in the file) -- see
+// that function's comment.
 
 // =====================================================================
 // Encoder -- ZATOR LMZ02, single-channel pulse train, no direction.
@@ -3059,6 +3055,22 @@ bool buttonState[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 
+// V4.15.40: field request -- "5 different LED as status", one per switch,
+// each showing that switch's real current on/off state (not the old
+// advanceLedCycle() round-robin, which only ever showed "who was pressed
+// last"). kMcpOutputPins[0..4] (ILED_R, ILED_G, ILED_B, ELED_R, ELED_G)
+// are dedicated 1:1 to SETUP/ALARM LOG/TREND FULL/TEST/DIAG in that
+// order; kMcpOutputPins[5..6] (ELED_B, ELED_Y) are unused by this feature
+// and stay free for manual bench testing (serial '6'/'7'). Called from
+// serviceHmiButtonPolling() on every real state change (both edges -- a
+// status LED must go off again when the switch does, unlike
+// handleHmiButtonPress()'s one-shot rising-edge actions).
+void setButtonStatusLed(uint8_t buttonIndex, bool on) {
+  if (!mcpOk || buttonIndex >= NS12::BUTTON_COUNT) return;
+  mcpOutputState[buttonIndex] = on;
+  mcp.digitalWrite(kMcpOutputPins[buttonIndex], on);
+}
+
 // V4.15.29: burst-probe mode ('H' serial command) -- the normal
 // BUTTON_POLL_INTERVAL_MS=750ms round-robin across 5 buttons only samples
 // any ONE of them every ~3.75s. A held-button test (checking whether the
@@ -3334,29 +3346,16 @@ void handleHmiButtonPress(uint8_t index) {
     printDiagnostics();
     break;
   // SETUP / ALARM LOG / TREND FULL: no subsystem exists yet for these --
-  // no setup-parameter screen, no alarm log, no trend recording. V4.15.21:
-  // each toggles one channel of the internal RGB LED (ILED_R/G/B) instead
-  // of just logging -- a tangible, physical end-to-end confirmation (touch
-  // -> RB read -> dispatch -> visible LED change) that doesn't require
-  // watching Serial. Real behavior still needs a spec -- what SETUP should
-  // configure, where the alarm log lives, what TREND FULL should show --
-  // before more goes here, same as HotMelt Start/End Position waited on
-  // the operator-entry spec before V4.15.7 built the position-tracking
-  // logic.
-  case 0: // SETUP
-  case 1: // ALARM LOG
-  case 2: { // TREND FULL
-    // All 3 share one round-robin LED cycle (all 7 internal+external
-    // channels) rather than each owning a fixed channel -- see
-    // advanceLedCycle()'s comment.
-    if (mcpOk) {
-      advanceLedCycle();
-      static const char *const kChannelNames[7] = {"ILED_R", "ILED_G", "ILED_B", "ELED_R",
-                                                     "ELED_G", "ELED_B", "ELED_Y"};
-      Serial.printf("[HMI]   ^ LED cycle -> %s ON\n", kChannelNames[ledCycleActiveIndex]);
-    }
+  // no setup-parameter screen, no alarm log, no trend recording. Real
+  // behavior still needs a spec -- what SETUP should configure, where the
+  // alarm log lives, what TREND FULL should show -- before more goes
+  // here, same as HotMelt Start/End Position waited on the operator-entry
+  // spec before V4.15.7 built the position-tracking logic. V4.15.40: each
+  // now has a dedicated status LED (set in serviceHmiButtonPolling(), not
+  // here -- see setButtonStatusLed()'s comment) as its physical, no-spec-
+  // needed confirmation instead of the old shared round-robin cycle.
+  default:
     break;
-  }
   }
 }
 #endif
@@ -3433,17 +3432,21 @@ void serviceHmiButtonPolling() {
       // real bit value read; the panel (Alternate switch) owns it
       // entirely, so there is nothing for the host to acknowledge or
       // clear anymore. handleHmiButtonPress() still fires exactly once
-      // per rising edge for its one-shot dispatch (LED cycle/test
-      // pattern/diagnostics); when the switch toggles back off, the
-      // matching falling edge is silently absorbed here (no action is
-      // currently defined for "button turned off").
+      // per rising edge for its one-shot dispatch (test pattern/
+      // diagnostics for TEST/DIAG); the falling edge has no one-shot
+      // action defined, but V4.15.40 gives it a real job below: turning
+      // the matching status LED back off.
       bool wasPressed = buttonState[i];
       buttonState[i] = pressed;
       // V4.15.39: clean, on-change-only status line -- "which function is
       // on" at a glance, replacing the noisy per-poll [HMI-RAW] firehose
       // (now debug-gated, see above) for normal terminal use.
+      // V4.15.40: dedicated status LED, tracking both edges (unlike
+      // handleHmiButtonPress()'s one-shot rising-edge actions) -- see
+      // setButtonStatusLed()'s comment.
       if (pressed != wasPressed) {
         Serial.printf("[SWITCH] %s -> %s\n", kButtonNames[i], pressed ? "ON" : "OFF");
+        setButtonStatusLed(i, pressed);
       }
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
