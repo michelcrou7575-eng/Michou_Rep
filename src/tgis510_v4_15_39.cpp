@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.38
+// Ref: TGIS-510_cpp_V4_15.39
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -821,6 +821,23 @@
 // still fires once per rising edge for its one-shot actions (LED cycle/
 // test pattern/diagnostics) -- only the writing back stops.
 //
+// FIELD UPDATE (V4.15.39): "clean the terminal and show which function is
+// on" -- the per-poll debug prints ([NS12-FRAME] for every RM/RB read,
+// [HMI-RAW] for every button poll, [NS12-WB-TX] for every WB send) were
+// all made unconditional at various points during the checksum/offset/
+// encoding investigation, specifically so real evidence couldn't be
+// missed. That investigation is done and every fix confirmed on hardware,
+// so all three are re-gated behind NS12_DEBUG_RAW_RX (default off) --
+// they remain available by flipping that one flag if this link ever needs
+// re-diagnosing. A redundant, already-gated duplicate of [NS12-FRAME]
+// (V4.15.13, never removed when V4.15.28 superseded it) is deleted rather
+// than also gated. In their place: a new unconditional "[SWITCH] <name>
+// -> ON/OFF" line, printed only when a switch's real state actually
+// changes -- the clean, at-a-glance "which function is on" the terminal
+// was missing. The existing periodic diagnostics dump's "instantaneous"
+// line (now genuinely live, per V4.15.38) still gives the full snapshot
+// on demand.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -852,10 +869,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.38"
+#define FW_VERSION_STRING "V4.15.39"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_38.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_39.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -2106,16 +2123,12 @@ public:
     }
     frame[n++] = '\r';
 
-    // V4.15.36: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
-    // print for every WB send -- mirrors the [NS12-FRAME] visibility RB
-    // already has. WB is fire-and-forget with no response to inspect, so
-    // until now the only way to check what a WB actually put on the wire
-    // was the full NS12_DEBUG_RAW_RX firehose. That gap mattered: the
-    // V4.15.33 encoding fix was only empirically verified for a single-bit
-    // write (count=1, "$B30" -> hex digit "8"); the 5-bit lamp write
-    // (count=5, 2 packed hex digits) has never been directly inspected on
-    // the wire, and a field report of "$B40 doesn't toggle" needs this
-    // evidence rather than another guess.
+    // CHANGED (V4.15.39): re-gated behind NS12_DEBUG_RAW_RX -- was made
+    // unconditional in V4.15.36 to check the multi-bit lamp-write
+    // encoding, which is now confirmed correct. WB fires on every button
+    // press/clear and telemetry write, so this was clutter for normal
+    // operation.
+#if NS12_DEBUG_RAW_RX
     Serial.print(F("[NS12-WB-TX] addr=0x"));
     Serial.print(startAddr, HEX);
     Serial.print(F(" count="));
@@ -2125,6 +2138,7 @@ public:
     Serial.print(F(" bytes): "));
     for (size_t i = 0; i < n; i++) printRawByteAlways((uint8_t)frame[i]);
     Serial.println();
+#endif
 
     wbAttempts++;
     size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
@@ -2500,12 +2514,15 @@ private:
       lastReadKind = (pendingCmdType == 'B') ? ReadKind::Bit : ReadKind::Word;
       lastReadValid = true;
 
-      // V4.15.28/31: unconditional (not gated by NS12_DEBUG_RAW_RX) raw-frame
-      // dump for every successful parse -- mirrors dumpRejectedLine()'s
-      // "don't gate the evidence that actually answers the question" policy.
-      // Extended to RM too in V4.15.31 (was RB-only) now that SUM-stripping
-      // changes RM's word values as well -- this is the evidence that lets
-      // the next real position read be checked against the fix.
+      // CHANGED (V4.15.39): re-gated behind NS12_DEBUG_RAW_RX. This was
+      // made unconditional in V4.15.28/31 to root-cause the checksum and
+      // address-offset bugs on real hardware -- both are now fixed and
+      // confirmed, so this firehose (one line per RM/RB read, several
+      // times a second) is pure terminal clutter for normal operation.
+      // Turn NS12_DEBUG_RAW_RX back on (below) if that evidence is ever
+      // needed again. The older near-duplicate debug block this
+      // superseded (V4.15.13) has been removed rather than gating both.
+#if NS12_DEBUG_RAW_RX
       Serial.print(F("[NS12-FRAME] R"));
       Serial.print(pendingCmdType);
       Serial.print(F(" offset="));
@@ -2519,29 +2536,6 @@ private:
       Serial.print(F("\" sum=0x"));
       Serial.print(receivedSum, HEX);
       Serial.print(F(" (ok) raw ("));
-      Serial.print(len);
-      Serial.print(F(" bytes): "));
-      for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
-      Serial.println();
-#if NS12_DEBUG_RAW_RX
-      // V4.15.13: RB successes need the same raw-bytes visibility failures
-      // already had (dumpRejectedLine) -- added after real hardware showed
-      // all 5 HMI buttons reading permanently pressed, which is physically
-      // implausible and needs to be told apart from "PT genuinely replied,
-      // just not with a plain 0/1" vs "this 'success' is actually our own
-      // RB request (or WM/telemetry traffic) echoing back and coincidentally
-      // satisfying the addr/count match." Only that raw evidence answers it.
-      Serial.print(F("[NS12] R"));
-      Serial.print(pendingCmdType);
-      Serial.print(F(" success, offset="));
-      Serial.print(offset);
-      Serial.print(F(", addr="));
-      Serial.print(addr, HEX);
-      Serial.print(F(", count="));
-      Serial.print(count);
-      Serial.print(F(", value="));
-      Serial.print(parsedValue, HEX);
-      Serial.print(F(", raw ("));
       Serial.print(len);
       Serial.print(F(" bytes): "));
       for (size_t i = 0; i < len; i++) printRawByteAlways((uint8_t)response[i]);
@@ -3409,16 +3403,17 @@ void serviceHmiButtonPolling() {
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != addr) continue;
 
-      // V4.15.27: raw-byte diagnostic -- see the NS12Manager::consumeReadBit()
-      // comment. Printed unconditionally (not just on a state change) so a
-      // controlled hold/release test has a clean, complete trace to read
-      // back. V4.15.31: now checksum-stripped (rawValue is genuinely just
-      // *D), and bit7 (MSB) is the real button bit per the manual's worked
-      // example -- printed alongside bit0 only so the fix is visible
-      // against prior logs, not because bit0 still means anything.
+      // CHANGED (V4.15.39): re-gated behind NS12_DEBUG_RAW_RX -- was made
+      // unconditional in V4.15.27 to root-cause the checksum/bit-position/
+      // address-offset bugs, all fixed and confirmed now. Printing this
+      // every ~750ms per button (or continuously in burst mode) was pure
+      // clutter for normal operation. See the new "[SWITCH]" print just
+      // below for the clean, on-change replacement.
+#if NS12_DEBUG_RAW_RX
       Serial.printf("[HMI-RAW] %-11s $B%-3u raw=0x%02X bit7=%u (bit0=%u)\n", kButtonNames[i],
                     kButtonAddrs[i], rawValue, (unsigned)((rawValue & 0x80) != 0),
                     (unsigned)(rawValue & 1));
+#endif
 
       // V4.15.23 field report (buttons firing with nobody touching the
       // screen) led to a 2-consecutive-reads debounce here, costing up to
@@ -3444,6 +3439,12 @@ void serviceHmiButtonPolling() {
       // currently defined for "button turned off").
       bool wasPressed = buttonState[i];
       buttonState[i] = pressed;
+      // V4.15.39: clean, on-change-only status line -- "which function is
+      // on" at a glance, replacing the noisy per-poll [HMI-RAW] firehose
+      // (now debug-gated, see above) for normal terminal use.
+      if (pressed != wasPressed) {
+        Serial.printf("[SWITCH] %s -> %s\n", kButtonNames[i], pressed ? "ON" : "OFF");
+      }
       if (pressed && !wasPressed) {
         handleHmiButtonPress(i);
       }
