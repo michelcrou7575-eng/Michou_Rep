@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.32
+// Ref: TGIS-510_cpp_V4_15.33
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -716,6 +716,25 @@
 // code's literal '0'/'1'-per-bit encoding (unchanged since V4.15.12) has
 // never been checked against.
 //
+// FIELD UPDATE (V4.15.33): the 'J' test came back conclusive -- writing
+// count=1, bits[0]=true to $B30 with the OLD encoding (literal ASCII "1")
+// read back as 0x00 via a checksum-validated RB, on our OWN write with no
+// touchscreen involved at all. That rules out "CX-Designer config only"
+// as the sole explanation: a real bug existed in sendWB() itself, and had
+// been there since V4.15.12. Fixed to match the manual's documented WB
+// *D encoding: 4 bits packed per hex digit, MSB-first ("fills data in
+// descending order starting with first digit") -- the same convention
+// that turned out to be the real RB fix, just for the write side.
+// bits[0]=true for a 1-bit write now encodes as hex digit "8" (binary
+// 1000, the requested bit in the nibble's MSB position), not "1". A
+// "false" write encodes as "0" either way, which is exactly why the
+// host-clear-to-0 path (every prior press-detection cycle) never showed
+// a symptom while every write of an ON bit -- lamps, and this test --
+// was silently malformed the whole time. Multi-bit writes (the 5-bit
+// lamp array) now pack into ceil(count/4) hex digits per the same rule,
+// instead of comma-separated literal characters. Send 'J' again on this
+// build: if $B30 finally reads back bit7=1, this was the fix.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -747,10 +766,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.32"
+#define FW_VERSION_STRING "V4.15.33"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_32.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_33.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1929,12 +1948,32 @@ public:
   // $B43, "TEST", Momentary) showed zero visible lamp change while WB was
   // writing to the offset address (0x4028). WB now writes the plain
   // address, matching sendWM.
+  //
+  // CORRECTED (V4.15.32): *D was being sent as one literal ASCII '0'/'1'
+  // character per bit, comma-separated -- mimicking WM's per-value comma
+  // format, never checked against the manual. The manual documents WB's
+  // *D as PACKED: 4 bits per hex digit, MSB-first ("fills data in
+  // descending order starting with first digit"), no commas -- the same
+  // MSB-first convention RB's own fix (V4.15.31) proved correct for reads.
+  // Proof this mattered: the V4.15.32 'J' self-test (writing count=1,
+  // bits[0]=true with the OLD encoding -- literal "1") read back as 0x00
+  // via a checksum-validated RB, on OUR OWN write with no touchscreen
+  // involved at all -- meaning a "true" bit was never actually reaching
+  // the PT's real memory in a form RB could see. A "false" bit happened to
+  // encode identically under both schemes ("0" either way), which is
+  // exactly why the host-clear-to-0 writes never showed a symptom while
+  // every write of an ON bit (lamps, this test) was silently wrong. Now
+  // packs bits[] into ceil(count/4) hex digits, bit k of digit d occupying
+  // position (3-k) within that nibble (MSB-first, matching the RB
+  // convention and the manual's own worked example).
   void sendWB(uint16_t startAddr, const bool *bits, uint8_t count) {
     if (count > NS12::MAX_WB_BITS) {
       count = NS12::MAX_WB_BITS;
       wbOversizedCount++;
     }
-    char frame[4 + 4 + 2 + NS12::MAX_WB_BITS * 2 + 1];
+    static const char kHexDigits[] = "0123456789ABCDEF";
+    uint8_t hexDigitCount = (uint8_t)((count + 3) / 4);
+    char frame[4 + 4 + 2 + (NS12::MAX_WB_BITS + 3) / 4 + 1];
     size_t n = 0;
     frame[n++] = (char)NS12::ESC;
     frame[n++] = 'W';
@@ -1942,9 +1981,15 @@ public:
     frame[n++] = '0';
     n += writeHex4(&frame[n], startAddr);
     n += writeDecimal2(&frame[n], count);
-    for (uint8_t i = 0; i < count; i++) {
-      if (i > 0) frame[n++] = ',';
-      frame[n++] = bits[i] ? '1' : '0';
+    for (uint8_t d = 0; d < hexDigitCount; d++) {
+      uint8_t nibble = 0;
+      for (uint8_t k = 0; k < 4; k++) {
+        uint8_t bitIndex = (uint8_t)(d * 4 + k);
+        if (bitIndex < count && bits[bitIndex]) {
+          nibble = (uint8_t)(nibble | (1 << (3 - k)));
+        }
+      }
+      frame[n++] = kHexDigits[nibble];
     }
     frame[n++] = '\r';
 
