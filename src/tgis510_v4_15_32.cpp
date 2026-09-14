@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.31
+// Ref: TGIS-510_cpp_V4_15.32
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -683,6 +683,39 @@
 // hardware run should show clean 0x00/0x80 button reads and genuine
 // presses finally registering.
 //
+// FIELD UPDATE (V4.15.32): the checksum fix held up under exhaustive
+// real-hardware retesting -- hundreds of burst-probe RB samples, all
+// checksum-valid, all genuinely 0x00 -- but genuine touchscreen presses
+// still never flip bit7, even after the CX-Designer switch type was
+// changed from Momentary to Alternate/SET and re-downloaded to the panel.
+// One field report of "$B30 shows ON on the HMI" turned out to be the
+// LAMP indicator ($B40, a separate address this firmware itself writes
+// via setActiveLamp()/sendWB() -- see that function), not live proof of a
+// touch reaching $B30; it was very likely left lit by an earlier
+// pre-checksum-fix phantom detection and never confirms anything about
+// the touch itself. Separately, a third-party suggestion proposing an
+// unsolicited WM-bitmask notify scheme was checked against the real
+// manual and rejected: it misstated the *S SET/OR encoding (manual: 1=SET,
+// not OR) and proposed reverting ESC/baud/pins to values already disproven
+// on this exact unit (0x1C, 38400, GPIO16/17) -- not used here. The
+// manual's real SM/SB/SD/SH change-notice commands do exist, but are
+// gated by a PT-side "Notice Start $B" threshold that only affects
+// unsolicited notify, not our direct RB reads -- irrelevant to why RB
+// reads 0.
+//
+// To isolate the remaining question -- is $B30 ever genuinely written by
+// anything, or is there still a firmware bug in the write path nobody has
+// tested -- added a 'J' serial command: writes 1 to $B30 via sendWB()
+// OURSELVES (no touchscreen involved at all) and bursts RB reads of it.
+// If it reads back bit7=1, sendWB()/requestRB()/parseReadResponse() are
+// proven correct end to end and the touch not reaching $B30 is
+// conclusively a CX-Designer/PT-side configuration issue. If even our own
+// write doesn't read back, that points at a real bug in sendWB()'s *D
+// encoding -- the manual describes WB's *D as 4-bits-per-hex-digit,
+// MSB-first (same convention RB's fix uncovered for reads), which this
+// code's literal '0'/'1'-per-bit encoding (unchanged since V4.15.12) has
+// never been checked against.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -714,10 +747,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.31"
+#define FW_VERSION_STRING "V4.15.32"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_31.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_32.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -3287,6 +3320,11 @@ void servicePlcControl() {
 //                 prints each, so they can be compared directly against
 //                 RB's [HMI-RAW] $B30..$B34 values -- an exact match proves
 //                 RB is silently landing on word memory, not bit memory
+//   J          -- WB-then-RB round-trip self-test (V4.15.32): writes 1 to
+//                 $B30 ourselves (no touchscreen), then bursts RB reads of
+//                 it -- isolates whether the read/write/address/checksum
+//                 pipeline is correct end to end, independent of whether
+//                 the touchscreen object ever actually writes there
 //
 // Separately, the HMI's own SETUP/ALARM LOG/TREND FULL/TEST/DIAG push-
 // buttons ($B30-$B34) are polled over NS12 RB (see serviceHmiButtonPolling()
@@ -3401,6 +3439,25 @@ void handleSerialCommand(char c) {
                       "compare against the RB [HMI-RAW] values for $B30..$B34."));
     break;
 #endif
+  case 'J': {
+    // V4.15.32: self-contained WB-then-RB round-trip test on $B30 -- writes
+    // a 1 to the button address OURSELVES (no touchscreen involved at all),
+    // then bursts RB reads of it so the very next poll shows whether our
+    // OWN write round-trips as bit7=1. Isolates the question completely:
+    // if this comes back 1, the ESP32<->PT read/write/address/checksum
+    // pipeline is fully proven end to end, and the touch never reaching
+    // $B30 is conclusively a CX-Designer/PT-side issue, not this firmware.
+    // If it comes back 0 even for our own write, that's a real remaining
+    // bug in sendWB() itself (worth checking against the manual's WB *D
+    // encoding, which packs 4 bits per hex digit MSB-first -- the same
+    // convention RB's fix already uncovered for reads).
+    bool oneBit = true;
+    ns12.sendWB(NS12::BUTTON_SETUP_ADDR, &oneBit, 1);
+    burstProbeUntilMs = millis() + 4000;
+    Serial.println(F("[WB-RB-TEST] Wrote 1 to $B30 (SETUP) ourselves, no touchscreen involved. "
+                      "Watching for bit7=1 on the next [HMI-RAW] SETUP line..."));
+    break;
+  }
   default:
     break;
   }
