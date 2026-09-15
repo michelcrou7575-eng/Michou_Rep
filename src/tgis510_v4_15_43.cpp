@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.42
+// Ref: TGIS-510_cpp_V4_15.43
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -877,7 +877,20 @@
 // timeout pattern -- markTxBusy()'s per-frame timing estimate scales with
 // NS12::BAUD automatically, so no other constant needs to move with it.
 //
-// Industrial QC system detecting hot-melt glue application on tubes moving
+// FIELD UPDATE (V4.15.43): "reset the other button on a new push" -- the 5
+// SETUP/ALARM LOG/TREND FULL/TEST/DIAG switches are mutually-exclusive
+// screen/function selectors, but native panel-side Alternate toggling
+// (V4.15.38) only guarantees each switch reflects ITS OWN real state; it
+// has no notion of the other 4, so more than one could stay lit at once
+// once switches are pressed out of order. serviceHmiButtonPolling() now
+// WB-clears every OTHER switch that's currently on at the moment a new one
+// is detected going ON, restoring one-active-at-a-time. This does not
+// revive the V4.15.38 host-clear-to-0 pattern the operator objected to --
+// that used to fight a switch's own bit right after ITS OWN press; this
+// only ever writes a DIFFERENT switch's bit, and only the one the panel's
+// own screen-selection logic didn't already turn off itself, so each
+// switch's own toggle is still the sole authority on its own state.
+
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
 // to an operator HMI (Omron NS12).
@@ -3408,6 +3421,13 @@ void handleHmiButtonPress(uint8_t index) {
 // handleHmiButtonPress() still fires once per rising edge (0->1) for its
 // one-shot side effects (LED cycle, test pattern, diagnostics) -- that
 // part doesn't change; only the writing back stops.
+//
+// V4.15.43: "only the writing back stops" above is no longer the whole
+// picture -- see the mutual-exclusion write added at the bottom of this
+// function's rising-edge branch, and its own FIELD UPDATE comment. It
+// writes a DIFFERENT switch's bit than the one that just changed, so it
+// does not conflict with this paragraph's still-true claim about a
+// switch's own bit.
 void serviceHmiButtonPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
@@ -3482,6 +3502,19 @@ void serviceHmiButtonPolling() {
         setButtonStatusLed(i, pressed);
       }
       if (pressed && !wasPressed) {
+        // V4.15.43: mutual exclusion -- clear every OTHER switch still
+        // showing on, since only one of the 5 screen/function selectors is
+        // ever meant to be active at a time. See this function's header
+        // FIELD UPDATE for why this doesn't reintroduce the V4.15.38
+        // host-clear-on-self pattern.
+        for (uint8_t j = 0; j < NS12::BUTTON_COUNT; j++) {
+          if (j == i || !buttonState[j]) continue;
+          bool offBit = false;
+          ns12.sendWB(kButtonAddrs[j], &offBit, 1);
+          buttonState[j] = false;
+          setButtonStatusLed(j, false);
+          Serial.printf("[SWITCH] %s -> OFF (reset by %s)\n", kButtonNames[j], kButtonNames[i]);
+        }
         handleHmiButtonPress(i);
       }
       break;
