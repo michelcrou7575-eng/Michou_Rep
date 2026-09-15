@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.48
+// Ref: TGIS-510_cpp_V4_15.49
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -963,6 +963,15 @@
 // incomplete trailing partial. Once a button's SB traffic is confirmed
 // live, BUTTON_POLL_INTERVAL_MS can be relaxed further -- left alone this
 // version since notify itself is the untested part.
+//
+// FIELD UPDATE (V4.15.49): SB notify confirmed live on real hardware --
+// field report "Instantly turn on the leds", i.e. sub-poll-interval
+// response, only explainable by the notify path (a 250ms round-robin
+// alone can't be instant). BUTTON_POLL_INTERVAL_MS relaxed 250ms ->
+// 2000ms now that it's just the safety-net resync it was always meant to
+// become, not the primary responsiveness path -- see this function's
+// FIELD UPDATE above. Real-time detection is now however fast the panel
+// itself sends SB, not this constant.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -2017,7 +2026,15 @@ constexpr uint16_t LAMP_DIAG_ADDR = 44;
 // NOT returning to exactly 200ms -- that's the specific value with a
 // documented failure on this hardware -- 250ms instead, as a middle
 // ground to verify against real RM/RB success rates before going lower.
-constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 250;
+//
+// RELAXED (V4.15.49): SB notify (see this file's header FIELD UPDATE)
+// confirmed live and instant on real hardware -- this constant is no
+// longer the responsiveness path, only a periodic safety-net resync in
+// case a notify is ever missed (e.g. the readLineUsed-reset race noted on
+// purgeRxBeforeRequest()). Raised to 2000ms accordingly; a worst case of
+// 10s to self-correct a missed notify is fine for a safety net, where
+// 1.25s worst case was not fine as the primary path.
+constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 2000;
 } // namespace NS12
 
 class NS12Manager {
