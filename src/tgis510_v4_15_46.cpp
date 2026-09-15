@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.45
+// Ref: TGIS-510_cpp_V4_15.46
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -912,6 +912,22 @@
 // successful frame -- no new acquisition or averaging logic needed, just
 // a rate-limited print toggle.
 //
+// FIELD UPDATE (V4.15.46): first real 'L' bench data (bare hand in front
+// of the camera, room-temp baseline) -- ambient noise floor sits around
+// +/-20 raw delta, hand peaks observed 50-84. CAPTURE_TRIGGER_RAW_DELTA
+// was still its blind PLACEHOLDER (300) -- far above anything a hand can
+// produce, so Strip1/2 never latched present regardless of MATRIX_TEMP_*_C
+// (a dead constant, unused by this live raw-delta path -- see its own
+// comment; editing it has zero effect on capture behavior). Lowered to 40
+// (about 2x the noise floor, comfortably under the observed hand peaks) so
+// a hand-heat bench test can actually trigger a capture. MATRIX_RAW_DELTA_MAX
+// lowered 1000 -> 150 to match: at 1000, an 84-count hand signal barely
+// registers on the HMI palette at all. Both are still placeholders in the
+// sense the comment above describes -- informed by a hand now, not hot-melt
+// glue, which will run far hotter -- so CAPTURE_TRIGGER_RAW_DELTA in
+// particular likely needs to go back up once real glue-temperature data
+// exists, or a hand near the lens could false-trigger a real inspection.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -1333,8 +1349,8 @@ static const uint8_t CAPTURE_SAMPLE_COUNT = 4;
 // 'X' against both an idle scene and a known-hot scene, read the
 // reported raw-minus-baseline deltas, and use those.
 static const float MATRIX_RAW_DELTA_MIN = 0.0f;      // PLACEHOLDER, no physical grounding
-static const float MATRIX_RAW_DELTA_MAX = 1000.0f;   // PLACEHOLDER, no physical grounding
-static const float CAPTURE_TRIGGER_RAW_DELTA = 300.0f; // PLACEHOLDER, no physical grounding
+static const float MATRIX_RAW_DELTA_MAX = 150.0f;    // V4.15.46 -- see FIELD UPDATE above
+static const float CAPTURE_TRIGGER_RAW_DELTA = 40.0f; // V4.15.46 -- see FIELD UPDATE above
 
 // =====================================================================
 // Timing constraint (critical, unresolved):
