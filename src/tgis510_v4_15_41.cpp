@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.40
+// Ref: TGIS-510_cpp_V4_15.41
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -853,6 +853,19 @@
 // print) in addition to their own dedicated status LED; SETUP/ALARM LOG/
 // TREND FULL still have no other defined action, same as before.
 //
+// FIELD UPDATE (V4.15.41): field report -- even with the dedicated status
+// LEDs and the V4.15.37 debounce removal, still "3-5 sec to react", which
+// is consistent with (not a new bug beyond) BUTTON_POLL_INTERVAL_MS=750ms
+// x 5 buttons = 3.75s worst-case round-robin. Lowered to 250ms as a
+// verify-first step -- see BUTTON_POLL_INTERVAL_MS's own comment for why
+// not the original 200ms (that specific value has a documented real-
+// hardware failure from V4.15.15, predating markTxBusy() and the
+// checksum/offset fixes) and why 250ms is now plausibly safe (burst mode
+// already polls all 5 buttons far faster than 200ms with zero anomalies
+// across hundreds of samples). Needs confirmation: watch NS12 RM/RB
+// success rates in the next diagnostics dump for any regression before
+// going lower.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -884,10 +897,10 @@
 //  Fixed here by deriving both from one constant.)
 // =====================================================================
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "V4.15.40"
+#define FW_VERSION_STRING "V4.15.41"
 #endif
 #ifndef FW_FILE_STRING
-#define FW_FILE_STRING "tgis510_v4_15_40.cpp"
+#define FW_FILE_STRING "tgis510_v4_15_41.cpp"
 #endif
 static const char *FW_VERSION = FW_VERSION_STRING;
 static const char *FW_FILE = FW_FILE_STRING;
@@ -1884,14 +1897,23 @@ constexpr uint16_t LAMP_DIAG_ADDR = 44;
 // polling"). Real hardware showed this badly oversubscribes the shared
 // link -- RM (position reads) crashed from ~91-96% success to 10/52
 // (~19%) once 200ms button polling was added, with RB itself only 58/216
-// (~27%). Buttons are occasional/diagnostic; HotMelt Start/End Position
-// feeds the actual tube-length-learning and Keyence-trigger logic, so
-// position-read reliability matters more than instant button feedback.
-// 750ms full-rotation-worth of spacing per button still catches any real
-// press well within a human's press-and-release window; see also the
-// loop() ordering change (position polling now goes first each tick) for
-// the other half of this fix.
-constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 750;
+// (~27%). At the time this pointed at genuine wire-level corruption (RB
+// failing that badly despite being the dominant request type isn't just
+// "starved of turns"), not merely a scheduling issue. Bumped to 750ms.
+//
+// LOWERED (V4.15.41): with 750ms x 5 buttons = 3.75s worst-case round-
+// robin, field report was "still takes 3-5 sec to react" even after
+// V4.15.37 removed the debounce that used to double it. The V4.15.15
+// failure predates markTxBusy() (V4.15.17, non-blocking TX-drain tracking
+// that ended the write/read collisions this link used to suffer) and the
+// checksum/offset fixes (V4.15.31/35) -- all of which independently
+// confirmed 100% RM/RB success at much higher request rates since (e.g.
+// the V4.15.29 burst-probe mode polls all 5 buttons back-to-back, far
+// faster than even the original 200ms, with zero anomalies). Deliberately
+// NOT returning to exactly 200ms -- that's the specific value with a
+// documented failure on this hardware -- 250ms instead, as a middle
+// ground to verify against real RM/RB success rates before going lower.
+constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 250;
 } // namespace NS12
 
 class NS12Manager {
