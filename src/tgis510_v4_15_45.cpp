@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.44
+// Ref: TGIS-510_cpp_V4_15.45
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -900,6 +900,18 @@
 // for this encoder) -- use the raw count to derive it: move the tube a
 // known distance and divide counts by mm.
 //
+// FIELD UPDATE (V4.15.45): real per-tube QC (CaptureController) only ever
+// evaluates once per tube, gated by a raw-delta threshold crossing --
+// correct for production but no good for bench testing without a tube
+// actually moving through. New 'L' serial command toggles a continuous
+// bench-test print (independent of CaptureController/presence/encoder
+// entirely): once a raw baseline is captured ('B'), it prints the live
+// per-frame min/max/avg raw delta at a steady rate for as long as it's on.
+// Reuses minimumTemperatureC/maximumTemperatureC/averageTemperatureC,
+// which calculateFrameStatistics() already recomputes fresh every
+// successful frame -- no new acquisition or averaging logic needed, just
+// a rate-limited print toggle.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -1093,6 +1105,12 @@ float averageTemperatureC = NAN;
 float measuredFramesPerSecond = 0.0f;
 uint32_t fpsWindowStartMs = 0;
 uint32_t fpsWindowFrameCount = 0;
+
+// V4.15.45: 'L' serial command toggle -- see that command's comment and
+// the FIELD UPDATE above.
+bool continuousMlxTestMode = false;
+uint32_t lastContinuousMlxPrintMs = 0;
+constexpr uint32_t CONTINUOUS_MLX_PRINT_INTERVAL_MS = 250;
 
 // =====================================================================
 // Raw-ADC-delta acquisition (V4.15.3) -- replaces per-frame calibrated
@@ -3705,6 +3723,19 @@ void handleSerialCommand(char c) {
   case 'D':
     printDiagnostics();
     break;
+  case 'L':
+    // V4.15.45: bench-test toggle -- continuous [MLX-LIVE] min/max/avg
+    // prints, independent of CaptureController's real one-shot-per-tube
+    // capture (no presence sensor / encoder / tube needed). Requires a
+    // baseline ('B') first, same as 'X'/'D' -- raw delta is meaningless
+    // without one.
+    continuousMlxTestMode = !continuousMlxTestMode;
+    Serial.printf("[MLX-LIVE] continuous reading %s%s\n",
+                  continuousMlxTestMode ? "ON" : "OFF",
+                  (continuousMlxTestMode && !rawBaselineCaptured)
+                      ? " (WARNING: no baseline yet -- send 'B' first)"
+                      : "");
+    break;
   case 'H':
     burstProbeUntilMs = millis() + BURST_PROBE_DURATION_MS;
     Serial.printf("[HMI-PROBE] Burst mode ON for %lu ms -- hold any HMI button NOW, watch for "
@@ -3937,6 +3968,16 @@ void loop() {
           subtractBaseline(rawPixelsNow, mlxFrame);
           calculateFrameStatistics();
           capture.onNewFrame(mlxFrame);
+
+          // V4.15.45: independent of CaptureController's one-shot-per-tube
+          // state above -- see 'L' command and its FIELD UPDATE comment.
+          if (continuousMlxTestMode &&
+              nowMs - lastContinuousMlxPrintMs >= CONTINUOUS_MLX_PRINT_INTERVAL_MS) {
+            lastContinuousMlxPrintMs = nowMs;
+            Serial.printf("[MLX-LIVE] min/max/avg raw delta=%.0f/%.0f/%.0f rejected=%u\n",
+                          minimumTemperatureC, maximumTemperatureC, averageTemperatureC,
+                          lastFrameRejectedPixelCount);
+          }
         }
         // else: no baseline yet and none in progress -- raw reads succeed
         // (fps/heartbeat/recovery logic all still work) but nothing feeds
