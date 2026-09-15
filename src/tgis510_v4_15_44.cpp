@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.43
+// Ref: TGIS-510_cpp_V4_15.44
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -890,7 +890,17 @@
 // only ever writes a DIFFERENT switch's bit, and only the one the panel's
 // own screen-selection logic didn't already turn off itself, so each
 // switch's own toggle is still the sole authority on its own state.
-
+//
+// FIELD UPDATE (V4.15.44): encoder now wired to a real ZATOR LMZ02 --
+// printDiagnostics() ('D') gains an "Encoder count" line (raw PCNT total
+// and the ENCODER_COUNTS_PER_MM-derived mm figure) so it's actually
+// visible over serial; encoder.total() was only ever consumed internally
+// (forward-projection math) before this. ENCODER_COUNTS_PER_MM is still
+// the placeholder 1.0 from Action Item 3 (real pulses-per-mm unconfirmed
+// for this encoder) -- use the raw count to derive it: move the tube a
+// known distance and divide counts by mm.
+//
+// Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
 // to an operator HMI (Omron NS12).
@@ -3291,6 +3301,10 @@ void printDiagnostics() {
                 lastFrameRejectedPixelCount, MIN_PLAUSIBLE_RAW_DELTA, MAX_PLAUSIBLE_RAW_DELTA);
   Serial.printf("Good/Failed frames : %lu / %lu\n",
                 (unsigned long)successfulFrameCount, (unsigned long)failedFrameCount);
+  // V4.15.44: encoder now physically wired -- total() was previously
+  // consumed only internally (forward-projection math), never printed.
+  Serial.printf("Encoder count (raw/mm) : %lld / %.1f\n", (long long)encoder.total(),
+                (float)encoder.total() / ENCODER_COUNTS_PER_MM);
 
   const char *captureStateStr = "?";
   switch (capture.currentState()) {
