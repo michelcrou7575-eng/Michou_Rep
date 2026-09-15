@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.41
+// Ref: TGIS-510_cpp_V4_15.42
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -866,6 +866,17 @@
 // success rates in the next diagnostics dump for any regression before
 // going lower.
 //
+// FIELD UPDATE (V4.15.42): raised NS12::BAUD 9600 -> 38400 at the operator's
+// request, on record that the earlier 9600 choice traces to a documented
+// ~15% RM timeout rate at 38400 in the original bench testing (see the
+// MERGE NOTE above) -- this reverses that call, not repeats it blind.
+// Requires the matching change on the panel side (CX-Designer Communication
+// Settings for the port driving Memory Link, redownloaded to the PT) before
+// this link will work at all; the two sides do not auto-negotiate. Watch
+// the next diagnostics dump's RM/RB success rates for a return of the old
+// timeout pattern -- markTxBusy()'s per-frame timing estimate scales with
+// NS12::BAUD automatically, so no other constant needs to move with it.
+//
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
 // both glue strips per tube pass, and pushes a stable QC-confirmation image
@@ -1641,7 +1652,7 @@ void IRAM_ATTR keyenceResultIsr() {
 
 namespace NS12 {
 constexpr uint8_t ESC = 0x1B;
-constexpr long BAUD = 9600; // CONFIRMED bench value -- see header note above
+constexpr long BAUD = 38400; // CHANGED (V4.15.42) -- see FIELD UPDATE above
 constexpr uint32_t RM_READ_TIMEOUT_MS = 250;
 
 // Word Lamp matrix -- default/trusted mode, 16x8 grid at $W700-$W827,
