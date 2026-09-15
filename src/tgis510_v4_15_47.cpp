@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.46
+// Ref: TGIS-510_cpp_V4_15.47
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -927,6 +927,20 @@
 // glue, which will run far hotter -- so CAPTURE_TRIGGER_RAW_DELTA in
 // particular likely needs to go back up once real glue-temperature data
 // exists, or a hand near the lens could false-trigger a real inspection.
+//
+// FIELD UPDATE (V4.15.47): real crash -- 'M' (and the HMI TEST button, same
+// code path) reliably hit "Guru Meditation Error ... Stack canary watchpoint
+// triggered (loopTask)" inside pushWordLampMatrix(), backtrace confirmed via
+// esp32_exception_decoder: pushWordLampMatrix() <- pushTestPattern() <-
+// handleSerialCommand() <- loop() <- loopTask. Root cause: pushTestPattern()'s
+// local testPattern[32*24] (3072 bytes) plus pushWordLampMatrix()'s local
+// words[32*24] (1536 bytes) -- ~4.6KB stacked in one call chain on top of
+// whatever loop() had already used -- overran loopTask's stack. This
+// function already made displayBuf static for exactly this reason; the
+// other two arrays were simply missed. Both moved to static storage here,
+// same justification: pushWordLampMatrix() is only ever called synchronously
+// from loop() (never reentrant, no ISR context), so a static buffer is safe
+// and this is a straight stack-to-.bss move, no logic change.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -2753,7 +2767,11 @@ void pushWordLampMatrix(const float *compositeFrame) {
     downsampleMaxBlock(compositeFrame, cols, rows, displayBuf);
   }
 
-  uint16_t words[32 * 24];
+  // V4.15.47: static -- was a stack array, part of the loopTask stack
+  // canary overrun fixed this version (see FIELD UPDATE above). Safe:
+  // this function is only ever called synchronously from loop(), never
+  // reentrant.
+  static uint16_t words[32 * 24];
   // Two halves (rows 0..rows/2-1, rows/2..rows-1), matching the documented
   // $W828 (rows 1-4) / $W829 (rows 5-8) band-maximum layout at 16x8.
   float bandMax[2] = {-1000, -1000};
@@ -2796,7 +2814,9 @@ void pushWordLampMatrix(const float *compositeFrame) {
 // factored out so both trigger the exact same diagnostic pattern instead of
 // two copies drifting apart.
 void pushTestPattern() {
-  float testPattern[StripZone::COLS * StripZone::ROWS];
+  // V4.15.47: static -- see pushWordLampMatrix()'s words[] comment and
+  // this version's FIELD UPDATE for why (stack canary overrun fix).
+  static float testPattern[StripZone::COLS * StripZone::ROWS];
   for (size_t i = 0; i < StripZone::COLS * StripZone::ROWS; i++) {
     testPattern[i] = MATRIX_RAW_DELTA_MIN + (MATRIX_RAW_DELTA_MAX - MATRIX_RAW_DELTA_MIN) *
                                                  ((float)i / (StripZone::COLS * StripZone::ROWS));
