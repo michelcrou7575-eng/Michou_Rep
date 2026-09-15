@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.47
+// Ref: TGIS-510_cpp_V4_15.48
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -941,6 +941,28 @@
 // same justification: pushWordLampMatrix() is only ever called synchronously
 // from loop() (never reentrant, no ISR context), so a static buffer is safe
 // and this is a straight stack-to-.bss move, no logic change.
+//
+// FIELD UPDATE (V4.15.48): added SB ($B change notice) support -- the
+// manual documents this as an unsolicited frame the PT sends on its own
+// whenever a $B bit at or above "Notice start $B" (CX-Designer Comm
+// Settings, default 16384) changes; no host request needed. Requires
+// lowering Notice start $B on the panel (e.g. to 0) and redownloading --
+// left at the default, $B30-$B34 are below the threshold and nothing will
+// ever be sent; the round-robin poll below is deliberately left at its
+// existing 250ms interval as a safety net until real SB traffic is
+// confirmed (new diagnostics line: "NS12 SB notify count/rejected").
+// Needed a real rework, not just a new parser: every requestRM()/
+// requestRB() purged the RX buffer before sending (clearRxBuffer(), to
+// drop leaked WM/WB echo bytes) and pollPendingRead() only ever drained
+// Serial2 while a read was pending -- either one would have silently
+// eaten a notify arriving between polls. Both are now notify-aware:
+// pollPendingRead() (renamed pollIncoming()) runs every service() tick
+// regardless of pendingness, and the pre-request purge (renamed
+// purgeRxBeforeRequest()) processes any complete queued line (SB
+// included) instead of blindly discarding it, only dropping a genuinely
+// incomplete trailing partial. Once a button's SB traffic is confirmed
+// live, BUTTON_POLL_INTERVAL_MS can be relaxed further -- left alone this
+// version since notify itself is the untested part.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -2088,7 +2110,7 @@ public:
 #endif
 
     rmAttempts++;
-    clearRxBuffer();
+    purgeRxBeforeRequest();
     size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
     if (sent != n) {
       // Request itself never fully went out -- don't burn the full
@@ -2149,7 +2171,7 @@ public:
 #endif
 
     rbAttempts++;
-    clearRxBuffer();
+    purgeRxBeforeRequest();
     size_t sent = Serial2.write(reinterpret_cast<uint8_t *>(frame), n);
     if (sent != n) {
       rbWriteFailures++;
@@ -2253,8 +2275,12 @@ public:
   // push and the non-blocking read state machine. Never blocks. RM
   // requests themselves are now driven externally by
   // serviceHmiInputPolling() (see below), not from inside here -- this
-  // just needs to keep pumping pollPendingRead() regardless of who called
+  // just needs to keep pumping pollIncoming() regardless of who called
   // requestRM().
+  //
+  // CHANGED (V4.15.48): pollIncoming() (was pollPendingRead()) now runs
+  // unconditionally, not just while readPending -- an unsolicited SB
+  // notify can arrive at any time, not only while we're mid-request.
   void service() {
     uint32_t now = millis();
 
@@ -2262,7 +2288,7 @@ public:
     // TELEMETRY_WRITE_INTERVAL_MS are both 250-300ms (and the HMI input
     // poll adds a third, slower request source), so a telemetry WM write
     // could otherwise fire in the middle of an in-flight RM read on this
-    // shared half-visible UART. pollPendingRead() only checks that a byte
+    // shared half-visible UART. pollIncoming() only checks that a byte
     // stream starts at an ESC, not where it actually came from -- see the
     // field-report comment on the NS12 namespace for why that matters
     // (every captured "RM response" so far had a WM-shaped header, before
@@ -2274,9 +2300,7 @@ public:
       sendWM(NS12::TELEMETRY_BASE_ADDR, telemetry, NS12::TELEMETRY_WORD_COUNT);
     }
 
-    if (readPending) {
-      pollPendingRead(now);
-    }
+    pollIncoming(now);
   }
 
   // Pop semantics: returns true (once) for the most recently completed
@@ -2369,6 +2393,19 @@ public:
   // namespace for why a WM write during a pending RM read is suspect.
   bool isReadPending() const { return readPending; }
 
+  // V4.15.48. Pop semantics like consumeReadBit(), but its own dedicated
+  // slot -- independent of readPending/pendingCmdType/lastReadKind
+  // entirely, since a notify isn't the response to anything we asked for.
+  bool consumeNotifyBit(uint16_t &addrOut, bool &valueOut) {
+    if (!notifyValid) return false;
+    addrOut = lastNotifyAddr;
+    valueOut = lastNotifyValue;
+    notifyValid = false;
+    return true;
+  }
+  uint32_t sbNotifyCount() const { return notifySbCount; }
+  uint32_t sbNotifyRejectedCount() const { return notifySbRejectedCount; }
+
 private:
   uint16_t telemetry[NS12::TELEMETRY_WORD_COUNT] = {};
   uint32_t lastTelemetryMs = 0;
@@ -2380,6 +2417,17 @@ private:
   uint8_t expectedCount = 0;
   char readLineBuffer[40] = {};
   size_t readLineUsed = 0;
+
+  // V4.15.48: SB notify state -- set by parseNotifySB(), popped by
+  // consumeNotifyBit(). Single-slot like the RM/RB result below: only one
+  // outstanding notify is ever tracked at a time, which is fine since
+  // service() runs often enough relative to how fast a human can press
+  // more than one button.
+  uint16_t lastNotifyAddr = 0;
+  bool lastNotifyValue = false;
+  bool notifyValid = false;
+  uint32_t notifySbCount = 0;
+  uint32_t notifySbRejectedCount = 0;
 
   // Set by parseReadResponse() on a successful parse, popped by
   // consumeReadWord() or consumeReadBit() depending on lastReadKind -- see
@@ -2415,8 +2463,16 @@ private:
   // new read until this passes.
   uint32_t txBusyUntilMs = 0;
 
-  void clearRxBuffer() {
-    while (Serial2.available() > 0) Serial2.read();
+  // RENAMED (V4.15.48, was clearRxBuffer()) -- still purges before every
+  // new request (see the call sites' comment for why: leaked WM/WB echo),
+  // but now processes any complete queued line first via pollIncoming()
+  // (an SB notify included) instead of blindly discarding everything.
+  // Only a genuinely incomplete trailing partial (no CR yet -- can't be
+  // trusted as a real frame either way) gets thrown away, via the
+  // explicit readLineUsed reset after.
+  void purgeRxBeforeRequest() {
+    pollIncoming(millis());
+    readLineUsed = 0;
   }
 
   // Called from sendWM()/sendWB() right after Serial2.write(). Root cause
@@ -2494,41 +2550,71 @@ private:
     Serial.print(']');
   }
 
-  // Non-blocking poll: consumes whatever bytes are currently available
-  // without waiting. Completes the pending read only once a full line
-  // (terminated by CR) has arrived, or aborts it on timeout/overflow.
-  void pollPendingRead(uint32_t now) {
+  // V4.15.48: dispatches one complete line (CR already stripped) to
+  // whichever of the two frame families it belongs to. SB is unsolicited
+  // and handled unconditionally -- it doesn't care whether a request is
+  // pending. Anything else only means something if we're actually waiting
+  // on it (readPending); otherwise it's stale/leaked and dropped, same as
+  // it always was for a mismatched line before this version. Shared by
+  // the every-tick drain (pollIncoming()) and the pre-request purge
+  // (purgeRxBeforeRequest()) so a notify can't fall through the crack
+  // between them.
+  void handleCompleteLine(const char *line, size_t len) {
+    if (len >= 3 && (uint8_t)line[0] == NS12::ESC && line[1] == 'S' && line[2] == 'B') {
+      if (parseNotifySB(line, len)) {
+        notifySbCount++;
+      } else {
+        notifySbRejectedCount++;
+      }
+      return;
+    }
+    if (!readPending) return;
+    bool isBit = (pendingCmdType == 'B');
+    if (parseReadResponse(line, len)) {
+      if (isBit) rbSuccesses++; else rmSuccesses++;
+    } else {
+      if (isBit) rbParseErrors++; else rmParseErrors++;
+      dumpRejectedLine(line, len);
+    }
+    readPending = false;
+  }
+
+  // RENAMED (V4.15.48, was pollPendingRead()) -- now runs every service()
+  // tick regardless of readPending, not just while a read is in flight, so
+  // an unsolicited SB notify gets drained and parsed as soon as it arrives
+  // instead of waiting for the next RM/RB request to happen to poll it.
+  // Non-blocking: consumes whatever bytes are currently available without
+  // waiting, dispatching every complete (CR-terminated) line it finds
+  // this tick -- more than one can be queued together (e.g. a notify
+  // followed immediately by the real RM/RB reply). A pending request
+  // still aborts on timeout/overflow exactly as before.
+  void pollIncoming(uint32_t now) {
     while (Serial2.available() > 0 && readLineUsed < sizeof(readLineBuffer) - 1) {
       char ch = (char)Serial2.read();
 
-      // A genuine RM response always starts with ESC. Anything arriving
-      // before that first ESC is stray (e.g. overlap with a WM write) and
-      // is discarded rather than corrupting the line.
+      // A genuine frame always starts with ESC. Anything arriving before
+      // that first ESC is stray (e.g. overlap with a WM write) and is
+      // discarded rather than corrupting the line.
       if (readLineUsed == 0 && (uint8_t)ch != NS12::ESC) {
         continue;
       }
 
       if (ch == '\r') {
         readLineBuffer[readLineUsed] = '\0';
-        bool isBit = (pendingCmdType == 'B');
-        if (parseReadResponse(readLineBuffer, readLineUsed)) {
-          if (isBit) rbSuccesses++; else rmSuccesses++;
-        } else {
-          if (isBit) rbParseErrors++; else rmParseErrors++;
-          dumpRejectedLine(readLineBuffer, readLineUsed);
-        }
-        readPending = false;
-        return;
+        handleCompleteLine(readLineBuffer, readLineUsed);
+        readLineUsed = 0;
+        continue;
       }
 
       readLineBuffer[readLineUsed++] = ch;
     }
 
-    if (!readPending) return; // completed above
+    if (!readPending) return;
 
     if (readLineUsed >= sizeof(readLineBuffer) - 1) {
       if (pendingCmdType == 'B') rbParseErrors++; else rmParseErrors++;
       readPending = false;
+      readLineUsed = 0;
       return;
     }
 
@@ -2536,6 +2622,38 @@ private:
       if (pendingCmdType == 'B') rbTimeouts++; else rmTimeouts++;
       readPending = false;
     }
+  }
+
+  // SB: PT memory ($B) change notice -- unsolicited, sent by the PT on its
+  // own whenever a $B bit at or above the panel's configured "Notice
+  // start $B" changes (see this version's FIELD UPDATE). Manual format:
+  // ESC 'S' 'B' *A(4-hex addr) *B(2-hex, "01" fixed -- always exactly one
+  // bit) *D(1-hex: 0=OFF/1=ON) SUM(2-hex), no CR counted here (stripped by
+  // the caller) -- 12 bytes total, always. Same SUM convention as
+  // parseReadResponse(): lower byte of the sum of every byte from ESC
+  // through *D, and the address is the plain PT memory address (no offset
+  // -- same as RB/WB, per the V4.15.35 finding that bits never take the
+  // $W-style offset).
+  bool parseNotifySB(const char *response, size_t len) {
+    if (len != 12 || (uint8_t)response[0] != NS12::ESC || response[1] != 'S' ||
+        response[2] != 'B') {
+      return false;
+    }
+    if (response[7] != '0' || response[8] != '1') return false; // *B always "01"
+    char d = response[9];
+    if (d != '0' && d != '1') return false;
+
+    char sumText[3] = {response[10], response[11], '\0'};
+    uint8_t receivedSum = (uint8_t)strtoul(sumText, nullptr, 16);
+    uint8_t computedSum = 0;
+    for (size_t i = 0; i < 10; i++) computedSum += (uint8_t)response[i];
+    if (computedSum != receivedSum) return false;
+
+    char addrText[5] = {response[3], response[4], response[5], response[6], '\0'};
+    lastNotifyAddr = (uint16_t)strtoul(addrText, nullptr, 16);
+    lastNotifyValue = (d == '1');
+    notifyValid = true;
+    return true;
   }
 
   // Response framing: ESC 'R' 'M'/'B' [maybe '0' echoed] AAAA(4-hex)
@@ -3388,6 +3506,11 @@ void printDiagnostics() {
                 (unsigned long)ns12.rbParseErrorCount());
   Serial.printf("NS12 WB attempts/failures : %lu / %lu\n", (unsigned long)ns12.wbAttemptCount(),
                 (unsigned long)ns12.wbFailureCount());
+  // V4.15.48: 0/0 here means no SB traffic has been seen at all -- check
+  // the panel's "Notice start $B" setting (see this version's FIELD
+  // UPDATE) before assuming the parser itself is at fault.
+  Serial.printf("NS12 SB notify count/rejected : %lu / %lu\n",
+                (unsigned long)ns12.sbNotifyCount(), (unsigned long)ns12.sbNotifyRejectedCount());
   Serial.print(F("HMI buttons (SETUP/ALARM LOG/TREND FULL/TEST/DIAG), instantaneous : "));
   for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
     Serial.print(buttonState[i] ? '1' : '0');
@@ -3472,7 +3595,6 @@ void handleHmiButtonPress(uint8_t index) {
     break;
   }
 }
-#endif
 
 // CHANGED (V4.15.38): the switches moved from Momentary to native
 // panel-side Alternate toggling ("we'll do toggle in HMI" -- ESP32-side
@@ -3496,9 +3618,86 @@ void handleHmiButtonPress(uint8_t index) {
 // writes a DIFFERENT switch's bit than the one that just changed, so it
 // does not conflict with this paragraph's still-true claim about a
 // switch's own bit.
+//
+// V4.15.48: factored out of serviceHmiButtonPolling() so the exact same
+// state-update/mutual-exclusion/dispatch logic runs whether button index
+// `i`'s new state arrived via the SB notify or the round-robin RB poll --
+// see serviceHmiButtonPolling()'s own comment for why there are now two
+// sources. Still inside the same NS12_ENABLE_RM_POLLING block opened
+// above handleHmiButtonPress() -- both are only ever reachable from
+// inside serviceHmiButtonPolling()'s own guarded body.
+void applyButtonBitUpdate(uint8_t i, bool pressed) {
+  // V4.15.23 field report (buttons firing with nobody touching the
+  // screen) led to a 2-consecutive-reads debounce here, costing up to
+  // one extra ~750ms poll cycle of detection latency (compounding
+  // with the 5-button round-robin's own 3.75s worst case into ~6-7.5s
+  // total, per a later field report). REMOVED in V4.15.37: that
+  // symptom's real cause turned out to be the checksum bug (V4.15.31)
+  // and the RB address offset bug (V4.15.35), both now fixed and
+  // hardware-confirmed clean (checksum-validated 0x00/0x80 reads,
+  // zero anomalies across hundreds of samples). Checksum validation
+  // in parseReadResponse() already rejects any genuinely corrupted
+  // frame outright -- a stronger guarantee than "wait for two reads
+  // to agree" ever was -- so a single accepted read is now trusted
+  // directly.
+  // V4.15.38: no more host-clear-to-0 write here -- see this
+  // function's header comment. buttonState[i] is simply set to the
+  // real bit value read; the panel (Alternate switch) owns it
+  // entirely, so there is nothing for the host to acknowledge or
+  // clear anymore. handleHmiButtonPress() still fires exactly once
+  // per rising edge for its one-shot dispatch (test pattern/
+  // diagnostics for TEST/DIAG); the falling edge has no one-shot
+  // action defined, but V4.15.40 gives it a real job below: turning
+  // the matching status LED back off.
+  bool wasPressed = buttonState[i];
+  buttonState[i] = pressed;
+  // V4.15.39: clean, on-change-only status line -- "which function is
+  // on" at a glance, replacing the noisy per-poll [HMI-RAW] firehose
+  // (debug-gated in serviceHmiButtonPolling()) for normal terminal use.
+  // V4.15.40: dedicated status LED, tracking both edges (unlike
+  // handleHmiButtonPress()'s one-shot rising-edge actions) -- see
+  // setButtonStatusLed()'s comment.
+  if (pressed != wasPressed) {
+    Serial.printf("[SWITCH] %s -> %s\n", kButtonNames[i], pressed ? "ON" : "OFF");
+    setButtonStatusLed(i, pressed);
+  }
+  if (pressed && !wasPressed) {
+    // V4.15.43: mutual exclusion -- clear every OTHER switch still
+    // showing on, since only one of the 5 screen/function selectors is
+    // ever meant to be active at a time. See serviceHmiButtonPolling()'s
+    // header FIELD UPDATE for why this doesn't reintroduce the V4.15.38
+    // host-clear-on-self pattern.
+    for (uint8_t j = 0; j < NS12::BUTTON_COUNT; j++) {
+      if (j == i || !buttonState[j]) continue;
+      bool offBit = false;
+      ns12.sendWB(kButtonAddrs[j], &offBit, 1);
+      buttonState[j] = false;
+      setButtonStatusLed(j, false);
+      Serial.printf("[SWITCH] %s -> OFF (reset by %s)\n", kButtonNames[j], kButtonNames[i]);
+    }
+    handleHmiButtonPress(i);
+  }
+}
+#endif
+
 void serviceHmiButtonPolling() {
 #if NS12_ENABLE_RM_POLLING
   uint32_t now = millis();
+
+  // V4.15.48: SB notify -- the primary, real-time path now (see this
+  // version's FIELD UPDATE). Checked first and independently of the
+  // round-robin poll below: notify arrival has nothing to do with
+  // isReadPending()/pollInterval timing.
+  uint16_t notifyAddr;
+  bool notifyPressed;
+  if (ns12.consumeNotifyBit(notifyAddr, notifyPressed)) {
+    for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
+      if (kButtonAddrs[i] != notifyAddr) continue;
+      applyButtonBitUpdate(i, notifyPressed);
+      break;
+    }
+  }
+
   // V4.15.34: no-offset RB test ('N' command) takes priority over the
   // normal round-robin -- see that command's comment. Retries every tick
   // (like the txBusy-deferred pattern elsewhere) until the link is free
@@ -3527,64 +3726,14 @@ void serviceHmiButtonPolling() {
       // unconditional in V4.15.27 to root-cause the checksum/bit-position/
       // address-offset bugs, all fixed and confirmed now. Printing this
       // every ~750ms per button (or continuously in burst mode) was pure
-      // clutter for normal operation. See the new "[SWITCH]" print just
-      // below for the clean, on-change replacement.
+      // clutter for normal operation. See the "[SWITCH]" print in
+      // applyButtonBitUpdate() for the clean, on-change replacement.
 #if NS12_DEBUG_RAW_RX
       Serial.printf("[HMI-RAW] %-11s $B%-3u raw=0x%02X bit7=%u (bit0=%u)\n", kButtonNames[i],
                     kButtonAddrs[i], rawValue, (unsigned)((rawValue & 0x80) != 0),
                     (unsigned)(rawValue & 1));
 #endif
-
-      // V4.15.23 field report (buttons firing with nobody touching the
-      // screen) led to a 2-consecutive-reads debounce here, costing up to
-      // one extra ~750ms poll cycle of detection latency (compounding
-      // with the 5-button round-robin's own 3.75s worst case into ~6-7.5s
-      // total, per a later field report). REMOVED in V4.15.37: that
-      // symptom's real cause turned out to be the checksum bug (V4.15.31)
-      // and the RB address offset bug (V4.15.35), both now fixed and
-      // hardware-confirmed clean (checksum-validated 0x00/0x80 reads,
-      // zero anomalies across hundreds of samples). Checksum validation
-      // in parseReadResponse() already rejects any genuinely corrupted
-      // frame outright -- a stronger guarantee than "wait for two reads
-      // to agree" ever was -- so a single accepted read is now trusted
-      // directly.
-      // V4.15.38: no more host-clear-to-0 write here -- see this
-      // function's header comment. buttonState[i] is simply set to the
-      // real bit value read; the panel (Alternate switch) owns it
-      // entirely, so there is nothing for the host to acknowledge or
-      // clear anymore. handleHmiButtonPress() still fires exactly once
-      // per rising edge for its one-shot dispatch (test pattern/
-      // diagnostics for TEST/DIAG); the falling edge has no one-shot
-      // action defined, but V4.15.40 gives it a real job below: turning
-      // the matching status LED back off.
-      bool wasPressed = buttonState[i];
-      buttonState[i] = pressed;
-      // V4.15.39: clean, on-change-only status line -- "which function is
-      // on" at a glance, replacing the noisy per-poll [HMI-RAW] firehose
-      // (now debug-gated, see above) for normal terminal use.
-      // V4.15.40: dedicated status LED, tracking both edges (unlike
-      // handleHmiButtonPress()'s one-shot rising-edge actions) -- see
-      // setButtonStatusLed()'s comment.
-      if (pressed != wasPressed) {
-        Serial.printf("[SWITCH] %s -> %s\n", kButtonNames[i], pressed ? "ON" : "OFF");
-        setButtonStatusLed(i, pressed);
-      }
-      if (pressed && !wasPressed) {
-        // V4.15.43: mutual exclusion -- clear every OTHER switch still
-        // showing on, since only one of the 5 screen/function selectors is
-        // ever meant to be active at a time. See this function's header
-        // FIELD UPDATE for why this doesn't reintroduce the V4.15.38
-        // host-clear-on-self pattern.
-        for (uint8_t j = 0; j < NS12::BUTTON_COUNT; j++) {
-          if (j == i || !buttonState[j]) continue;
-          bool offBit = false;
-          ns12.sendWB(kButtonAddrs[j], &offBit, 1);
-          buttonState[j] = false;
-          setButtonStatusLed(j, false);
-          Serial.printf("[SWITCH] %s -> OFF (reset by %s)\n", kButtonNames[j], kButtonNames[i]);
-        }
-        handleHmiButtonPress(i);
-      }
+      applyButtonBitUpdate(i, pressed);
       break;
     }
   }
