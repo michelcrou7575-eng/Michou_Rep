@@ -1,5 +1,5 @@
 // TGIS-510 -- Thermal Glue Inspection System
-// Ref: TGIS-510_cpp_V4_15.49
+// Ref: TGIS-510_cpp_V4_15.50
 //
 // Home-lab / after-hours project. Separate from the 410 Rotaliner Tubing Seal
 // Seam Monitor (factory floor, S7-300/ATmega2560) -- do not conflate.
@@ -972,6 +972,23 @@
 // become, not the primary responsiveness path -- see this function's
 // FIELD UPDATE above. Real-time detection is now however fast the panel
 // itself sends SB, not this constant.
+//
+// FIELD UPDATE (V4.15.50): dedicated diagnostic-screen buttons -- one per
+// serial command (S/W/I/G/F/1-9/A/K/P/M/C/B/X/R/D/H/V/J/N/L, 28 total),
+// each its own new $B bit at NS12::DIAG_BUTTON_BASE_ADDR ($B50) and up,
+// contiguous. Reuses handleSerialCommand() directly (each button's rising
+// edge just calls it with that command's char) rather than reimplementing
+// 28 action branches -- same NS12 read/notify plumbing as the 5 main
+// buttons (applyDiagButtonUpdate(), its own round-robin safety-net
+// cursor), but no LED, no mutual exclusion: these are independent
+// one-shot triggers, not the modal screen-selector buttons are. PLACEHOLDER
+// addresses, same caveat as LAMP_SETUP_ADDR etc: not confirmed against a
+// real CX-Designer Symbol Table -- build the matching screen with these
+// exact addresses (Alternate switch type, same as the 5 main buttons)
+// before this does anything. CAUTION: this exposes real state-machine
+// overrides (S/W/I/G/F, including FaultStop) and a Keyence trigger pulse
+// (K) to a touchscreen tap -- consider a password-protected CX-Designer
+// screen for this rather than one reachable during normal operation.
 //
 // Industrial QC system detecting hot-melt glue application on tubes moving
 // at high speed. Confirms glue presence, temperature, and quantity across
@@ -2035,6 +2052,14 @@ constexpr uint16_t LAMP_DIAG_ADDR = 44;
 // 10s to self-correct a missed notify is fine for a safety net, where
 // 1.25s worst case was not fine as the primary path.
 constexpr uint32_t BUTTON_POLL_INTERVAL_MS = 2000;
+
+// V4.15.50: dedicated diagnostic-screen buttons, one per serial command --
+// see this file's header FIELD UPDATE. Addresses are contiguous starting
+// here, so a button's index doubles as its address offset -- no separate
+// address array needed anywhere this is used.
+constexpr uint16_t DIAG_BUTTON_BASE_ADDR = 50;
+constexpr uint8_t DIAG_BUTTON_COUNT = 28;
+constexpr uint32_t DIAG_BUTTON_POLL_INTERVAL_MS = 2000; // safety-net only, same reasoning as BUTTON_POLL_INTERVAL_MS
 } // namespace NS12
 
 class NS12Manager {
@@ -3300,6 +3325,27 @@ bool buttonState[NS12::BUTTON_COUNT] = {};
 uint32_t lastButtonPollMs = 0;
 uint8_t nextButtonPollIndex = 0;
 
+// V4.15.50: dedicated diagnostic-screen buttons -- see this file's header
+// FIELD UPDATE. kDiagCommandChars[i] is the exact char handleSerialCommand()
+// switches on; $B(DIAG_BUTTON_BASE_ADDR + i) is that button's address.
+// 'V' (word verify) is only meaningful with NS12_ENABLE_RM_POLLING, which
+// this whole block is already inside.
+constexpr char kDiagCommandChars[NS12::DIAG_BUTTON_COUNT] = {
+    'S', 'W', 'I', 'G', 'F', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+    'A', 'K', 'P', 'M', 'C', 'B', 'X', 'R', 'D', 'H', 'V', 'J', 'N', 'L'};
+const char *const kDiagButtonNames[NS12::DIAG_BUTTON_COUNT] = {
+    "STANDBY",      "WAIT_TUBE",       "INSPECTING",  "TUBE_GAP",
+    "FAULT_STOP",   "IO1",             "IO2",         "IO3",
+    "IO4",          "IO5",             "IO6",         "IO7",
+    "IO8",          "IO9",             "OPTO3",       "KEYENCE_TRIG",
+    "PLC_STATUS",   "TEST_PATTERN",    "CAPTURE_REARM", "BASELINE_CAPTURE",
+    "FRAME_DUMP",   "REARM_BLANK",     "DIAGNOSTICS", "BURST_PROBE",
+    "WORD_VERIFY",  "WB_RB_SELFTEST",  "NO_OFFSET_TEST", "MLX_LIVE_TOGGLE"};
+bool diagButtonState[NS12::DIAG_BUTTON_COUNT] = {};
+uint32_t lastDiagButtonPollMs = 0;
+uint8_t nextDiagButtonPollIndex = 0;
+uint32_t diagButtonPressCount = 0;
+
 // V4.15.40: field request -- "5 different LED as status", one per switch,
 // each showing that switch's real current on/off state (not the old
 // advanceLedCycle() round-robin, which only ever showed "who was pressed
@@ -3542,6 +3588,9 @@ void printDiagnostics() {
     Serial.print((unsigned long)buttonPressCount[i]);
     Serial.print(i + 1 < NS12::BUTTON_COUNT ? '/' : '\n');
   }
+  // V4.15.50: one combined counter, not 28 individual ones -- see this
+  // file's header FIELD UPDATE for the full command/address list.
+  Serial.printf("HMI diag-screen presses (lifetime) : %lu\n", (unsigned long)diagButtonPressCount);
 #else
   Serial.println(F("NS12 RM polling    : disabled (PT doesn't respond -- see NS12 namespace comment)"));
 #endif
@@ -3695,6 +3744,42 @@ void applyButtonBitUpdate(uint8_t i, bool pressed) {
     handleHmiButtonPress(i);
   }
 }
+
+// V4.15.50: address -> diag-button-index lookup. Addresses are contiguous
+// from NS12::DIAG_BUTTON_BASE_ADDR, so this is arithmetic, not a search.
+bool addrToDiagIndex(uint16_t addr, uint8_t &indexOut) {
+  if (addr < NS12::DIAG_BUTTON_BASE_ADDR) return false;
+  uint16_t idx = addr - NS12::DIAG_BUTTON_BASE_ADDR;
+  if (idx >= NS12::DIAG_BUTTON_COUNT) return false;
+  indexOut = (uint8_t)idx;
+  return true;
+}
+
+// Forward declaration: handleSerialCommand() is defined further down this
+// file (it also handles literal keystrokes from the USB serial monitor),
+// but applyDiagButtonUpdate() -- called from serviceHmiButtonPolling(),
+// which comes first -- needs to call it now that HMI buttons can fire the
+// exact same commands. Reusing it directly means every one of the 28
+// diagnostic actions has exactly one implementation, not two copies to
+// keep in sync.
+void handleSerialCommand(char c);
+
+// V4.15.50: diagnostic-screen buttons -- unlike applyButtonBitUpdate()
+// above, no LED (only 5 physical status LEDs exist, already spoken for)
+// and no mutual exclusion (these are independent one-shot triggers, not
+// modal screen selectors). Fires on the rising edge only, exactly like
+// handleHmiButtonPress()'s TEST/DIAG cases -- a falling edge (button
+// released/toggled back off on the panel) has no action here.
+void applyDiagButtonUpdate(uint8_t i, bool pressed) {
+  bool wasPressed = diagButtonState[i];
+  diagButtonState[i] = pressed;
+  if (pressed && !wasPressed) {
+    diagButtonPressCount++;
+    Serial.printf("[HMI-DIAG] %s ($B%u) -> '%c'\n", kDiagButtonNames[i],
+                  (unsigned)(NS12::DIAG_BUTTON_BASE_ADDR + i), kDiagCommandChars[i]);
+    handleSerialCommand(kDiagCommandChars[i]);
+  }
+}
 #endif
 
 void serviceHmiButtonPolling() {
@@ -3703,15 +3788,26 @@ void serviceHmiButtonPolling() {
 
   // V4.15.48: SB notify -- the primary, real-time path now (see this
   // version's FIELD UPDATE). Checked first and independently of the
-  // round-robin poll below: notify arrival has nothing to do with
+  // round-robin polls below: notify arrival has nothing to do with
   // isReadPending()/pollInterval timing.
+  // V4.15.50: falls through to the diag-button range when it isn't one
+  // of the main 5 -- same notify, same single-slot consumer, just a
+  // wider address space to recognize now.
   uint16_t notifyAddr;
   bool notifyPressed;
   if (ns12.consumeNotifyBit(notifyAddr, notifyPressed)) {
+    bool matched = false;
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != notifyAddr) continue;
       applyButtonBitUpdate(i, notifyPressed);
+      matched = true;
       break;
+    }
+    if (!matched) {
+      uint8_t diagIndex;
+      if (addrToDiagIndex(notifyAddr, diagIndex)) {
+        applyDiagButtonUpdate(diagIndex, notifyPressed);
+      }
     }
   }
 
@@ -3732,10 +3828,22 @@ void serviceHmiButtonPolling() {
     }
   }
 
+  // V4.15.50: diag-button safety-net poll -- same shape as the main
+  // button poll just above, own cursor/interval, gated on the same
+  // isReadPending() so it never competes with that poll, the RM position
+  // poll, or an 'N'/'V' one-shot test for the single outstanding request.
+  if (!noOffsetTestPending && !ns12.isReadPending() &&
+      now - lastDiagButtonPollMs >= NS12::DIAG_BUTTON_POLL_INTERVAL_MS) {
+    lastDiagButtonPollMs = now;
+    ns12.requestRB(NS12::DIAG_BUTTON_BASE_ADDR + nextDiagButtonPollIndex, 1);
+    nextDiagButtonPollIndex = (nextDiagButtonPollIndex + 1) % NS12::DIAG_BUTTON_COUNT;
+  }
+
   uint16_t addr;
   bool pressed;
   uint16_t rawValue;
   if (ns12.consumeReadBit(addr, pressed, rawValue)) {
+    bool matched = false;
     for (uint8_t i = 0; i < NS12::BUTTON_COUNT; i++) {
       if (kButtonAddrs[i] != addr) continue;
 
@@ -3751,7 +3859,14 @@ void serviceHmiButtonPolling() {
                     (unsigned)(rawValue & 1));
 #endif
       applyButtonBitUpdate(i, pressed);
+      matched = true;
       break;
+    }
+    if (!matched) {
+      uint8_t diagIndex;
+      if (addrToDiagIndex(addr, diagIndex)) {
+        applyDiagButtonUpdate(diagIndex, pressed);
+      }
     }
   }
 #endif
